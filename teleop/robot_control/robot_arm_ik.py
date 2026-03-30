@@ -15,6 +15,15 @@ sys.path.append(parent2_dir)
 
 from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 
+
+def homogeneous_from_position_rotation(p_ee_target, R_ee_target):
+    """由位置与旋转矩阵构造 4x4 齐次变换（与 solve_ik 输入一致）。"""
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = np.asarray(R_ee_target, dtype=np.float64).reshape(3, 3)
+    T[:3, 3] = np.asarray(p_ee_target, dtype=np.float64).reshape(3)
+    return T
+
+
 class G1_29_ArmIK:
     def __init__(self, Unit_Test = False, Visualization = False):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
@@ -249,6 +258,21 @@ class G1_29_ArmIK:
         robot_left_pose[:3, 3] *= scale_factor
         robot_right_pose[:3, 3] *= scale_factor
         return robot_left_pose, robot_right_pose
+
+    def solve_from_ee_pose(
+        self,
+        side: str,
+        p_ee_target: np.ndarray,
+        R_ee_target: np.ndarray,
+        current_lr_arm_motor_q,
+        current_lr_arm_motor_dq,
+        other_wrist_4x4: np.ndarray,
+    ):
+        """单侧末端位姿 + 对侧齐次矩阵，内部仍走双臂 solve_ik。"""
+        T = homogeneous_from_position_rotation(p_ee_target, R_ee_target)
+        if str(side).lower() == "left":
+            return self.solve_ik(T, other_wrist_4x4, current_lr_arm_motor_q, current_lr_arm_motor_dq)
+        return self.solve_ik(other_wrist_4x4, T, current_lr_arm_motor_q, current_lr_arm_motor_dq)
 
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
         if current_lr_arm_motor_q is not None:
@@ -528,6 +552,20 @@ class G1_23_ArmIK:
         robot_left_pose[:3, 3] *= scale_factor
         robot_right_pose[:3, 3] *= scale_factor
         return robot_left_pose, robot_right_pose
+
+    def solve_from_ee_pose(
+        self,
+        side: str,
+        p_ee_target: np.ndarray,
+        R_ee_target: np.ndarray,
+        current_lr_arm_motor_q,
+        current_lr_arm_motor_dq,
+        other_wrist_4x4: np.ndarray,
+    ):
+        T = homogeneous_from_position_rotation(p_ee_target, R_ee_target)
+        if str(side).lower() == "left":
+            return self.solve_ik(T, other_wrist_4x4, current_lr_arm_motor_q, current_lr_arm_motor_dq)
+        return self.solve_ik(other_wrist_4x4, T, current_lr_arm_motor_q, current_lr_arm_motor_dq)
 
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
         if current_lr_arm_motor_q is not None:
@@ -832,6 +870,20 @@ class H1_2_ArmIK:
         robot_left_pose[:3, 3] *= scale_factor
         robot_right_pose[:3, 3] *= scale_factor
         return robot_left_pose, robot_right_pose
+
+    def solve_from_ee_pose(
+        self,
+        side: str,
+        p_ee_target: np.ndarray,
+        R_ee_target: np.ndarray,
+        current_lr_arm_motor_q,
+        current_lr_arm_motor_dq,
+        other_wrist_4x4: np.ndarray,
+    ):
+        T = homogeneous_from_position_rotation(p_ee_target, R_ee_target)
+        if str(side).lower() == "left":
+            return self.solve_ik(T, other_wrist_4x4, current_lr_arm_motor_q, current_lr_arm_motor_dq)
+        return self.solve_ik(other_wrist_4x4, T, current_lr_arm_motor_q, current_lr_arm_motor_dq)
 
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
         if current_lr_arm_motor_q is not None:
@@ -1139,6 +1191,20 @@ class H1_ArmIK:
         robot_left_pose[:3, 3] *= scale_factor
         robot_right_pose[:3, 3] *= scale_factor
         return robot_left_pose, robot_right_pose
+
+    def solve_from_ee_pose(
+        self,
+        side: str,
+        p_ee_target: np.ndarray,
+        R_ee_target: np.ndarray,
+        current_lr_arm_motor_q,
+        current_lr_arm_motor_dq,
+        other_wrist_4x4: np.ndarray,
+    ):
+        T = homogeneous_from_position_rotation(p_ee_target, R_ee_target)
+        if str(side).lower() == "left":
+            return self.solve_ik(T, other_wrist_4x4, current_lr_arm_motor_q, current_lr_arm_motor_dq)
+        return self.solve_ik(other_wrist_4x4, T, current_lr_arm_motor_q, current_lr_arm_motor_dq)
 
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
         if current_lr_arm_motor_q is not None:

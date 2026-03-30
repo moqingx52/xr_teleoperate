@@ -6,8 +6,9 @@ import logging_mp
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
 
-import os 
+import os
 import sys
+import numpy as np
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
@@ -15,7 +16,13 @@ sys.path.append(parent_dir)
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
 from televuer import TeleVuerWrapper
 from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController
-from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK
+from teleop.robot_control.robot_arm_ik import (
+    G1_29_ArmIK,
+    G1_23_ArmIK,
+    H1_2_ArmIK,
+    H1_ArmIK,
+    homogeneous_from_position_rotation,
+)
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
@@ -70,10 +77,10 @@ def get_state() -> dict:
         "RECORD_RUNNING": RECORD_RUNNING,
     }
 
-if __name__ == '__main__':
+def build_arg_parser():
     parser = argparse.ArgumentParser()
     # basic control parameters
-    parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
+    parser.add_argument('--frequency', type=float, default=30.0, help='control and record\'s frequency')
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1'], default='G1_29', help='Select arm controller')
@@ -81,21 +88,58 @@ if __name__ == '__main__':
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # mode flags
-    parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
+    parser.add_argument('--motion', action='store_true', help='Enable motion control mode')
     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
-    parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
-    parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
-    parser.add_argument('--affinity', action = 'store_true', help = 'Enable high priority and set CPU affinity mode')
+    parser.add_argument('--sim', action='store_true', help='Enable isaac simulation mode')
+    parser.add_argument('--ipc', action='store_true', help='Enable IPC server to handle input; otherwise enable sshkeyboard')
+    parser.add_argument('--affinity', action='store_true', help='Enable high priority and set CPU affinity mode')
     # record mode and task info
-    parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
-    parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
-    parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task file name for recording')
-    parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
-    parser.add_argument('--task-desc', type = str, default = 'task description', help = 'task description for recording at json file')
-    parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
+    parser.add_argument('--record', action='store_true', help='Enable data recording mode')
+    parser.add_argument('--task-dir', type=str, default='./utils/data/', help='path to save data')
+    parser.add_argument('--task-name', type=str, default='pick cube', help='task file name for recording')
+    parser.add_argument('--task-goal', type=str, default='pick up cube.', help='task goal for recording at json file')
+    parser.add_argument('--task-desc', type=str, default='task description', help='task description for recording at json file')
+    parser.add_argument('--task-steps', type=str, default='step1: do this; step2: do that;', help='task steps for recording at json file')
+    # HaMeR / offline JSON input (与 hamer/demo.py: --structured_file 默认 hamer_structured_results.json)
+    parser.add_argument('--input-source', '--input_source', type=str, default='xr', choices=['xr', 'hamer'],
+                        dest='input_source', help='xr: TeleVuer; hamer: structured JSON replay')
+    parser.add_argument('--hamer-json', '--hamer_json', type=str, default=None, dest='hamer_json',
+                        help='Absolute or relative path to structured JSON (demo: out_folder/hamer_structured_results.json)')
+    parser.add_argument('--hamer-out-dir', '--hamer_out_dir', type=str, default=None, dest='hamer_out_dir',
+                        help='HaMeR demo --out_folder; JSON path becomes <dir>/<hamer_structured_file>')
+    parser.add_argument('--hamer-structured-file', '--hamer_structured_file', type=str, default='hamer_structured_results.json',
+                        dest='hamer_structured_file', help='Same default as hamer demo.py --structured_file')
+    parser.add_argument('--replay-fps', '--replay_fps', type=float, default=None, dest='replay_fps',
+                        help='If set, overrides --frequency for main-loop timing (offline replay)')
+    parser.add_argument('--hamer-loop', '--hamer_loop', action='store_true', dest='hamer_loop', help='Loop JSON when end is reached')
+    parser.add_argument('--hamer-score-thresh', '--hamer_score_thresh', type=float, default=0.5, dest='hamer_score_thresh',
+                        help='Min detection score per hand row')
+    parser.add_argument('--hamer-arm-only', '--hamer_arm_only', action='store_true', dest='hamer_arm_only',
+                        help='Do not drive hand from XR/HaMeR (arm only)')
+    parser.add_argument('--hamer-frame-offset-json', '--hamer_frame_offset_json', type=str, default=None,
+                        dest='hamer_frame_offset_json', help='Optional JSON for frame index offsets')
+    return parser
 
-    args = parser.parse_args()
+
+def main(argv=None):
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.replay_fps is not None:
+        args.frequency = float(args.replay_fps)
+    if args.input_source == "hamer":
+        if args.hamer_json:
+            args.hamer_json = os.path.abspath(os.path.expanduser(args.hamer_json))
+        elif args.hamer_out_dir:
+            args.hamer_json = os.path.join(
+                os.path.abspath(os.path.expanduser(args.hamer_out_dir)),
+                args.hamer_structured_file,
+            )
     logger_mp.info(f"args: {args}")
+    if args.input_source == "hamer" and not args.hamer_json:
+        logger_mp.error("HaMeR mode requires --hamer-json/--hamer_json or --hamer-out-dir/--hamer_out_dir")
+        exit(1)
+    if args.input_source == "hamer" and args.motion and args.input_mode == "controller":
+        logger_mp.warning("HaMeR input does not drive locomotion; motion+controller may be inactive.")
 
     try:
         # setup dds communication domains id
@@ -120,23 +164,42 @@ if __name__ == '__main__':
         camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
+        if args.input_source == "hamer":
+            xr_need_local_img = False
 
-        # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
-        tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
-                                     binocular=camera_config['head_camera']['binocular'],
-                                     img_shape=camera_config['head_camera']['image_shape'],
-                                     # maybe should decrease fps for better performance?
-                                     # https://github.com/unitreerobotics/xr_teleoperate/issues/172
-                                     # display_fps=camera_config['head_camera']['fps'] ? args.frequency? 30.0?
-                                     display_mode=args.display_mode,
-                                     zmq=camera_config['head_camera']['enable_zmq'],
-                                     webrtc=camera_config['head_camera']['enable_webrtc'],
-                                     webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
-                                     )
+        tv_wrapper = None
+        hamer_input = None
+        hamer_adapter = None
+        last_hamer_left_tf = np.eye(4, dtype=np.float64)
+        last_hamer_left_tf[:3, 3] = np.array([0.25, 0.25, 0.1], dtype=np.float64)
+        last_hamer_right_tf = np.eye(4, dtype=np.float64)
+        last_hamer_right_tf[:3, 3] = np.array([0.25, -0.25, 0.1], dtype=np.float64)
+
+        if args.input_source == "xr":
+            tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand",
+                                         binocular=camera_config['head_camera']['binocular'],
+                                         img_shape=camera_config['head_camera']['image_shape'],
+                                         display_mode=args.display_mode,
+                                         zmq=camera_config['head_camera']['enable_zmq'],
+                                         webrtc=camera_config['head_camera']['enable_webrtc'],
+                                         webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
+                                         )
+        else:
+            from teleop.input_source.hamer_input import HamerInputSource
+            from teleop.input_source.hamer_adapter import HamerAdapter
+            from teleop.input_source.hamer_to_robot_frame import WristToEEConfig
+
+            hamer_input = HamerInputSource(
+                json_path=args.hamer_json,
+                score_thresh=args.hamer_score_thresh,
+                loop=args.hamer_loop,
+                frame_offset_json=args.hamer_frame_offset_json,
+            )
+            hamer_adapter = HamerAdapter(WristToEEConfig.identity())
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.motion:
-            if args.input_mode == "controller":
+            if args.input_mode == "controller" and args.input_source == "xr":
                 loco_wrapper = LocoClientWrapper()
         else:
             motion_switcher = MotionSwitcher()
@@ -250,7 +313,7 @@ if __name__ == '__main__':
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
-            if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+            if tv_wrapper is not None and camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 tv_wrapper.render_to_xr(head_img)
 
@@ -263,7 +326,7 @@ if __name__ == '__main__':
             if camera_config['head_camera']['enable_zmq']:
                 if args.record or xr_need_local_img:
                     head_img = img_client.get_head_frame()
-                if xr_need_local_img:
+                if tv_wrapper is not None and xr_need_local_img:
                     tv_wrapper.render_to_xr(head_img)
             if camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
@@ -286,19 +349,36 @@ if __name__ == '__main__':
                     if args.sim:
                         publish_reset_category(1, reset_pose_publisher)
 
-            # get xr's tele data
-            tele_data = tv_wrapper.get_tele_data()
-            if (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
+            # get xr's tele data or HaMeR frame
+            tele_data = None
+            if args.input_source == "xr":
+                tele_data = tv_wrapper.get_tele_data()
+            hamer_frame = None
+            if args.input_source == "hamer":
+                hamer_frame = hamer_input.get_frame()
+                if hamer_frame is None and not args.hamer_loop:
+                    logger_mp.info("HaMeR JSON finished (no loop); stopping.")
+                    STOP = True
+                    break
+
+            # HaMeR 首版不接 XR/JSON 手指；--hamer-arm-only 显式关闭手部跟随（与 XR 并用时预留）
+            skip_hand_tele = args.input_source == "hamer" or args.hamer_arm_only
+            if (
+                tele_data is not None
+                and (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco")
+                and args.input_mode == "hand"
+                and not skip_hand_tele
+            ):
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
                     right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
-            elif args.ee == "dex1" and args.input_mode == "controller":
+            elif tele_data is not None and args.ee == "dex1" and args.input_mode == "controller":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
                 with right_gripper_value.get_lock():
                     right_gripper_value.value = tele_data.right_ctrl_triggerValue
-            elif args.ee == "dex1" and args.input_mode == "hand":
+            elif tele_data is not None and args.ee == "dex1" and args.input_mode == "hand":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_hand_pinchValue
                 with right_gripper_value.get_lock():
@@ -307,7 +387,7 @@ if __name__ == '__main__':
                 pass
             
             # high level control
-            if args.input_mode == "controller" and args.motion:
+            if args.input_mode == "controller" and args.motion and tele_data is not None:
                 # quit teleoperate
                 if tele_data.right_ctrl_aButton:
                     START = False
@@ -326,7 +406,20 @@ if __name__ == '__main__':
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
-            sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
+            if args.input_source == "xr":
+                sol_q, sol_tauff = arm_ik.solve_ik(
+                    tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq
+                )
+            else:
+                targets = hamer_adapter.step(hamer_frame, current_lr_arm_q)
+                lt, rt = targets["left_arm"], targets["right_arm"]
+                if lt["valid"]:
+                    last_hamer_left_tf = homogeneous_from_position_rotation(lt["p_ee_target"], lt["R_ee_target"])
+                if rt["valid"]:
+                    last_hamer_right_tf = homogeneous_from_position_rotation(rt["p_ee_target"], rt["R_ee_target"])
+                sol_q, sol_tauff = arm_ik.solve_ik(
+                    last_hamer_left_tf, last_hamer_right_tf, current_lr_arm_q, current_lr_arm_dq
+                )
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
@@ -351,7 +444,7 @@ if __name__ == '__main__':
                         right_hand_action = [dual_gripper_action_array[1]]
                         current_body_state = []
                         current_body_action = []
-                elif args.ee == "dex1" and args.input_mode == "controller":
+                elif args.ee == "dex1" and args.input_mode == "controller" and tele_data is not None:
                     with dual_gripper_data_lock:
                         left_ee_state = [dual_gripper_state_array[0]]
                         right_ee_state = [dual_gripper_state_array[1]]
@@ -504,7 +597,8 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to close image client: {e}")
 
         try:
-            tv_wrapper.close()
+            if tv_wrapper is not None:
+                tv_wrapper.close()
         except Exception as e:
             logger_mp.error(f"Failed to close televuer wrapper: {e}")
 
@@ -529,3 +623,7 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to close recorder: {e}")
         logger_mp.info("✅ Finally, exiting program.")
         exit(0)
+
+
+if __name__ == "__main__":
+    main()
