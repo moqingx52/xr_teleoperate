@@ -18,6 +18,7 @@ class HamerAdapter:
         relative_position_mode: bool = False,
         left_home: Optional[np.ndarray] = None,
         right_home: Optional[np.ndarray] = None,
+        mirror_lr_across_xz: bool = False,
         relative_compress: bool = False,
         relative_scale: float = 0.02,
         relative_clip_xyz: Optional[np.ndarray] = None,
@@ -30,6 +31,7 @@ class HamerAdapter:
         self.relative_position_mode = bool(relative_position_mode)
         self.left_home = np.asarray(left_home if left_home is not None else [0.25, 0.25, 0.1], dtype=np.float64).reshape(3)
         self.right_home = np.asarray(right_home if right_home is not None else [0.25, -0.25, 0.1], dtype=np.float64).reshape(3)
+        self.mirror_lr_across_xz = bool(mirror_lr_across_xz)
         self.relative_compress = bool(relative_compress)
         self.relative_scale = float(relative_scale)
         if relative_clip_xyz is None:
@@ -46,9 +48,18 @@ class HamerAdapter:
         self._R_r = np.eye(3)
         self._anchor_l = None
         self._anchor_r = None
+        self._M_xz = np.diag(np.array([1.0, -1.0, 1.0], dtype=np.float64))
 
     def _side_valid(self, side_data: Dict[str, Any]) -> bool:
         return isinstance(side_data, dict) and side_data.get("valid", False)
+
+    def _mirror_across_xz(self, p: np.ndarray, R: np.ndarray):
+        p = np.asarray(p, dtype=np.float64).reshape(3)
+        R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+        M = self._M_xz
+        p_m = M @ p
+        R_m = M @ R @ M
+        return p_m, R_m
 
     def step(self, frame_data: Optional[Dict[str, Any]], current_q: Optional[np.ndarray] = None) -> Dict[str, Any]:
         """
@@ -79,13 +90,18 @@ class HamerAdapter:
             ("left", "_gap_left", "_have_left", "_p_l", "_R_l", "left"),
             ("right", "_gap_right", "_have_right", "_p_r", "_R_r", "right"),
         ):
-            sd = frame_data.get(side_key, {})
+            src_side_key = side_key
+            if self.mirror_lr_across_xz:
+                src_side_key = "right" if side_key == "left" else "left"
+            sd = frame_data.get(src_side_key, {})
             valid = self._side_valid(sd)
             if valid:
                 setattr(self, gap_attr, 0)
                 p_w = sd["p_wrist_base"]
                 R_w = sd["R_wrist_base"]
                 p_ee, R_ee = wrist_to_ee_target(ee_side, p_w, R_w, self.wrist_calib)
+                if self.mirror_lr_across_xz:
+                    p_ee, R_ee = self._mirror_across_xz(p_ee, R_ee)
                 if self.relative_position_mode:
                     if side_key == "left":
                         if self._anchor_l is None:

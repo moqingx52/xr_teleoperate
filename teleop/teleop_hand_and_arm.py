@@ -126,6 +126,8 @@ def build_arg_parser():
                         help='Do not drive hand from XR/HaMeR (arm only)')
     parser.add_argument('--hamer-relative-pos', '--hamer_relative_pos', action='store_true', dest='hamer_relative_pos',
                         help='Use first valid HaMeR wrist position as anchor; move around robot home positions')
+    parser.add_argument('--hamer-mirror-lr-xz', '--hamer_mirror_lr_xz', action='store_true', dest='hamer_mirror_lr_xz',
+                        help='Swap left/right HaMeR wrists and mirror across robot xz-plane (y->-y)')
     parser.add_argument('--hamer-relative-compress', '--hamer_relative_compress', action='store_true',
                         dest='hamer_relative_compress',
                         help='With --hamer-relative-pos: scale + clip relative delta (mitigate depth drift until metric depth is fixed)')
@@ -247,6 +249,7 @@ def main(argv=None):
                 relative_position_mode=args.hamer_relative_pos,
                 left_home=np.asarray(args.hamer_left_home, dtype=np.float64),
                 right_home=np.asarray(args.hamer_right_home, dtype=np.float64),
+                mirror_lr_across_xz=args.hamer_mirror_lr_xz,
                 relative_compress=args.hamer_relative_compress,
                 relative_scale=float(args.hamer_relative_scale),
                 relative_clip_xyz=np.asarray(args.hamer_relative_clip, dtype=np.float64),
