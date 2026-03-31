@@ -99,9 +99,11 @@ class HamerAdapter:
                 setattr(self, gap_attr, 0)
                 p_w = sd["p_wrist_base"]
                 R_w = sd["R_wrist_base"]
-                p_ee, R_ee = wrist_to_ee_target(ee_side, p_w, R_w, self.wrist_calib)
                 if self.mirror_lr_across_xz:
-                    p_ee, R_ee = self._mirror_across_xz(p_ee, R_ee)
+                    # Correct order for symmetric remap:
+                    # 1) swap side source, 2) mirror wrist pose across robot xz plane, 3) apply target-side wrist->ee calibration.
+                    p_w, R_w = self._mirror_across_xz(p_w, R_w)
+                p_ee, R_ee = wrist_to_ee_target(ee_side, p_w, R_w, self.wrist_calib)
                 if self.relative_position_mode:
                     if side_key == "left":
                         if self._anchor_l is None:
