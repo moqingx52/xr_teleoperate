@@ -55,6 +55,68 @@ def _print_stats(name: str, arr: np.ndarray) -> None:
     print(f"  mean = {_fmt_vec(np.mean(arr, axis=0))}")
 
 
+def _linear_slope(frame_idx: np.ndarray, vals: np.ndarray) -> np.ndarray:
+    if frame_idx.size < 2:
+        return np.zeros(3, dtype=np.float64)
+    x = frame_idx.astype(np.float64)
+    x_mean = float(np.mean(x))
+    den = float(np.sum((x - x_mean) ** 2))
+    if den < 1e-12:
+        return np.zeros(3, dtype=np.float64)
+    slopes = []
+    for i in range(3):
+        y = vals[:, i].astype(np.float64)
+        y_mean = float(np.mean(y))
+        num = float(np.sum((x - x_mean) * (y - y_mean)))
+        slopes.append(num / den)
+    return np.asarray(slopes, dtype=np.float64)
+
+
+def _print_segment_stats(name: str, arr: np.ndarray) -> None:
+    n = arr.shape[0]
+    if n < 3:
+        print(f"{name}: not enough data for segment stats")
+        return
+    a = arr[: max(1, n // 3)]
+    b = arr[n // 3 : max(n // 3 + 1, 2 * n // 3)]
+    c = arr[2 * n // 3 :]
+    print(f"{name} (first/middle/last mean):")
+    print(f"  first  = {_fmt_vec(np.mean(a, axis=0))}")
+    print(f"  middle = {_fmt_vec(np.mean(b, axis=0))}")
+    print(f"  last   = {_fmt_vec(np.mean(c, axis=0))}")
+
+
+def _print_drift_diagnostics(side: str, frame_idx: np.ndarray, base_arr: np.ndarray, home: np.ndarray) -> None:
+    if base_arr.shape[0] == 0:
+        print("drift diagnostics: no data")
+        return
+
+    anchor = base_arr[0].copy()
+    rel = base_arr - anchor[None, :]
+    target = home[None, :] + rel
+    step = np.diff(target, axis=0) if target.shape[0] > 1 else np.empty((0, 3), dtype=np.float64)
+
+    slope_base = _linear_slope(frame_idx, base_arr)
+    slope_rel = _linear_slope(frame_idx, rel)
+    slope_target = _linear_slope(frame_idx, target)
+
+    print("drift diagnostics:")
+    print(f"  anchor(base first frame) = {_fmt_vec(anchor)}")
+    print(f"  home(target center)      = {_fmt_vec(home)}")
+    print(f"  slope p_base   (m/frame) = {_fmt_vec(slope_base)}")
+    print(f"  slope rel      (m/frame) = {_fmt_vec(slope_rel)}")
+    print(f"  slope p_target (m/frame) = {_fmt_vec(slope_target)}")
+    _print_stats("relative displacement rel = p_base - anchor", rel)
+    _print_stats("relative target p_target = home + rel", target)
+    _print_segment_stats("p_target", target)
+    if step.shape[0] > 0:
+        _print_stats("frame-to-frame step of p_target", step)
+        pos_z_ratio = float(np.mean(step[:, 2] > 0.0))
+        print(f"  ratio(step.z > 0) = {pos_z_ratio:.3f}")
+    else:
+        print("frame-to-frame step of p_target: not enough frames")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Debug HaMeR p_wrist/R_wrist -> p_base transform using T_cam2base."
@@ -62,6 +124,22 @@ def main() -> None:
     parser.add_argument("--hamer-json", required=True, help="Path to hamer structured JSON")
     parser.add_argument("--hamer-cam2base-json", required=True, help="Path to cam2base JSON with 4x4 T_cam2base")
     parser.add_argument("--show-n", type=int, default=5, help="Show first N converted samples per side")
+    parser.add_argument(
+        "--left-home",
+        type=float,
+        nargs=3,
+        default=[0.25, 0.25, 0.1],
+        metavar=("X", "Y", "Z"),
+        help="Left home position used to simulate --hamer-relative-pos",
+    )
+    parser.add_argument(
+        "--right-home",
+        type=float,
+        nargs=3,
+        default=[0.25, -0.25, 0.1],
+        metavar=("X", "Y", "Z"),
+        help="Right home position used to simulate --hamer-relative-pos",
+    )
     args = parser.parse_args()
 
     hamer_json = os.path.abspath(os.path.expanduser(args.hamer_json))
@@ -88,6 +166,7 @@ def main() -> None:
 
     cam_pts = {"left": [], "right": []}
     base_pts = {"left": [], "right": []}
+    frame_idx_pts = {"left": [], "right": []}
     samples = {"left": [], "right": []}
     skipped = 0
 
@@ -109,6 +188,7 @@ def main() -> None:
 
         cam_pts[side].append(p_cam)
         base_pts[side].append(p_base)
+        frame_idx_pts[side].append(int(rec.get("frame_idx", -1)))
         if len(samples[side]) < max(0, int(args.show_n)):
             samples[side].append(
                 (
@@ -124,12 +204,33 @@ def main() -> None:
     print(f"skipped:       {skipped}")
     print("")
 
+    left_home = np.asarray(args.left_home, dtype=np.float64).reshape(3)
+    right_home = np.asarray(args.right_home, dtype=np.float64).reshape(3)
+    print("=== Relative mode simulation ===")
+    print(f"left_home:  {_fmt_vec(left_home)}")
+    print(f"right_home: {_fmt_vec(right_home)}")
+    print("")
+
     for side in ("left", "right"):
         print(f"=== {side.upper()} position stats ===")
         cam_arr = np.asarray(cam_pts[side], dtype=np.float64).reshape(-1, 3) if cam_pts[side] else np.empty((0, 3))
         base_arr = np.asarray(base_pts[side], dtype=np.float64).reshape(-1, 3) if base_pts[side] else np.empty((0, 3))
+        frame_arr = (
+            np.asarray(frame_idx_pts[side], dtype=np.int64).reshape(-1)
+            if frame_idx_pts[side]
+            else np.empty((0,), dtype=np.int64)
+        )
+        if frame_arr.size > 0:
+            order = np.argsort(frame_arr)
+            frame_arr = frame_arr[order]
+            cam_arr = cam_arr[order]
+            base_arr = base_arr[order]
         _print_stats("p_wrist(cam)", cam_arr)
         _print_stats("p_base", base_arr)
+        if frame_arr.size > 0:
+            print(f"frame range: [{int(frame_arr[0])}, {int(frame_arr[-1])}] ({frame_arr.size} samples)")
+        home = left_home if side == "left" else right_home
+        _print_drift_diagnostics(side, frame_arr.astype(np.float64), base_arr, home)
         print("samples (frame_idx, p_cam -> p_base):")
         if not samples[side]:
             print("  no samples")
