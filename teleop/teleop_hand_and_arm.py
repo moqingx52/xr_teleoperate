@@ -212,9 +212,13 @@ def main(argv=None):
             if args.input_mode == "controller" and args.input_source == "xr":
                 loco_wrapper = LocoClientWrapper()
         else:
-            motion_switcher = MotionSwitcher()
-            status, result = motion_switcher.Enter_Debug_Mode()
-            logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
+            # 真机：通过 MotionSwitcher 释放占用以便臂控；Isaac 等仿真无该服务，跳过以免 ClientStub 报错
+            if not args.sim:
+                motion_switcher = MotionSwitcher()
+                status, result = motion_switcher.Enter_Debug_Mode()
+                logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
+            else:
+                logger_mp.info("Simulation mode: skip MotionSwitcher / Enter_Debug_Mode")
 
         # arm
         if args.arm == "G1_29":

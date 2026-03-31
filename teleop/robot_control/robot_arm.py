@@ -88,6 +88,7 @@ class G1_29_ArmController:
         self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
         self.lowstate_subscriber.Init()
         self.lowstate_buffer = DataBuffer()
+        self._lowstate_read_hit_logged = False
 
         # initialize subscribe thread
         self.subscribe_thread = threading.Thread(target=self._subscribe_motor_state)
@@ -139,14 +140,21 @@ class G1_29_ArmController:
         logger_mp.info("Initialize G1_29_ArmController OK!")
 
     def _subscribe_motor_state(self):
+        _read_n = 0
         while True:
             msg = self.lowstate_subscriber.Read()
+            _read_n += 1
             if msg is not None:
+                if not self._lowstate_read_hit_logged:
+                    print("[G1_29_ArmController] lowstate Read hit (first msg)")
+                    self._lowstate_read_hit_logged = True
                 lowstate = G1_29_LowState()
                 for id in range(G1_29_Num_Motors):
                     lowstate.motor_state[id].q  = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
                 self.lowstate_buffer.SetData(lowstate)
+            elif _read_n <= 3 or _read_n % 5000 == 0:
+                print(f"[G1_29_ArmController] lowstate Read returned None (poll n={_read_n})")
             time.sleep(0.002)
 
     def clip_arm_q_target(self, target_q, velocity_limit):
