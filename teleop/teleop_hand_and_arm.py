@@ -118,6 +118,9 @@ def build_arg_parser():
                         help='Do not drive hand from XR/HaMeR (arm only)')
     parser.add_argument('--hamer-frame-offset-json', '--hamer_frame_offset_json', type=str, default=None,
                         dest='hamer_frame_offset_json', help='Optional JSON for frame index offsets')
+    parser.add_argument('--hamer-cam2base-json', '--hamer_cam2base_json', type=str, default=None,
+                        dest='hamer_cam2base_json',
+                        help='When HaMeR JSON has p_wrist/R_wrist only: same 4x4 T_cam2base JSON as HaMeR --cam2base_json')
     return parser
 
 
@@ -138,9 +141,15 @@ def main(argv=None):
     if args.input_source == "hamer" and not args.hamer_json:
         logger_mp.error("HaMeR mode requires --hamer-json/--hamer_json or --hamer-out-dir/--hamer_out_dir")
         exit(1)
+    if args.input_source == "hamer" and args.hamer_cam2base_json:
+        args.hamer_cam2base_json = os.path.abspath(os.path.expanduser(args.hamer_cam2base_json))
     if args.input_source == "hamer" and args.motion and args.input_mode == "controller":
         logger_mp.warning("HaMeR input does not drive locomotion; motion+controller may be inactive.")
 
+    arm_ctrl = None
+    sim_state_subscriber = None
+    ipc_server = None
+    listen_keyboard_thread = None
     try:
         # setup dds communication domains id
         if args.sim:
@@ -194,6 +203,7 @@ def main(argv=None):
                 score_thresh=args.hamer_score_thresh,
                 loop=args.hamer_loop,
                 frame_offset_json=args.hamer_frame_offset_json,
+                cam2base_json=args.hamer_cam2base_json,
             )
             hamer_adapter = HamerAdapter(WristToEEConfig.identity())
         
@@ -578,14 +588,15 @@ def main(argv=None):
         logger_mp.error(traceback.format_exc())
     finally:
         try:
-            arm_ctrl.ctrl_dual_arm_go_home()
+            if arm_ctrl is not None:
+                arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
         
         try:
-            if args.ipc:
+            if args.ipc and ipc_server is not None:
                 ipc_server.stop()
-            else:
+            elif not args.ipc and listen_keyboard_thread is not None:
                 stop_listening()
                 listen_keyboard_thread.join()
         except Exception as e:
@@ -611,7 +622,7 @@ def main(argv=None):
             logger_mp.error(f"Failed to exit debug mode: {e}")
 
         try:
-            if args.sim:
+            if args.sim and sim_state_subscriber is not None:
                 sim_state_subscriber.stop_subscribe()
         except Exception as e:
             logger_mp.error(f"Failed to stop sim state subscriber: {e}")
