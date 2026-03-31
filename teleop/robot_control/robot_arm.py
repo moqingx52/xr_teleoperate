@@ -1,7 +1,10 @@
 import numpy as np
+import sys
 import threading
 import time
 from enum import IntEnum
+
+import unitree_sdk2py
 
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize # dds
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import ( LowCmd_  as hg_LowCmd, LowState_ as hg_LowState) # idl for g1, h1_2
@@ -87,6 +90,16 @@ class G1_29_ArmController:
         self.lowcmd_publisher.Init()
         self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
         self.lowstate_subscriber.Init()
+        print(
+            "[G1_29_ArmController] lowstate subscriber: "
+            f"topic={kTopicLowState!r} type={hg_LowState!r} typename={getattr(hg_LowState, '__name__', hg_LowState)}"
+        )
+        print(f"[G1_29_ArmController] runtime: python={sys.executable}")
+        print(f"[G1_29_ArmController] runtime: unitree_sdk2py={unitree_sdk2py.__file__}")
+        print(
+            "[G1_29_ArmController] runtime: "
+            f"LowState_ module={hg_LowState.__module__} LowState_={hg_LowState}"
+        )
         self.lowstate_buffer = DataBuffer()
         self._lowstate_read_hit_logged = False
 
@@ -145,14 +158,19 @@ class G1_29_ArmController:
             msg = self.lowstate_subscriber.Read()
             _read_n += 1
             if msg is not None:
-                if not self._lowstate_read_hit_logged:
-                    print("[G1_29_ArmController] lowstate Read hit (first msg)")
-                    self._lowstate_read_hit_logged = True
-                lowstate = G1_29_LowState()
-                for id in range(G1_29_Num_Motors):
-                    lowstate.motor_state[id].q  = msg.motor_state[id].q
-                    lowstate.motor_state[id].dq = msg.motor_state[id].dq
-                self.lowstate_buffer.SetData(lowstate)
+                try:
+                    if not self._lowstate_read_hit_logged:
+                        print("[G1_29_ArmController] lowstate callback hit")
+                        self._lowstate_read_hit_logged = True
+                    lowstate = G1_29_LowState()
+                    for id in range(G1_29_Num_Motors):
+                        lowstate.motor_state[id].q  = msg.motor_state[id].q
+                        lowstate.motor_state[id].dq = msg.motor_state[id].dq
+                    self.lowstate_buffer.SetData(lowstate)
+                except Exception as e:
+                    print(
+                        f"[G1_29_ArmController] lowstate callback hit but buffer write failed: {e!r}"
+                    )
             elif _read_n <= 3 or _read_n % 5000 == 0:
                 print(f"[G1_29_ArmController] lowstate Read returned None (poll n={_read_n})")
             time.sleep(0.002)
