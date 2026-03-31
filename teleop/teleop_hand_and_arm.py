@@ -133,6 +133,7 @@ def build_arg_parser():
 
 
 def main(argv=None):
+    global START, STOP, READY, RECORD_RUNNING, RECORD_TOGGLE
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     if args.replay_fps is not None:
@@ -604,11 +605,14 @@ def main(argv=None):
             logger_mp.debug(f"main process sleep: {sleep_time}")
 
     except KeyboardInterrupt:
+        STOP = True
         logger_mp.info("⛔ KeyboardInterrupt, exiting program...")
     except Exception:
+        STOP = True
         import traceback
         logger_mp.error(traceback.format_exc())
     finally:
+        STOP = True
         try:
             if arm_ctrl is not None:
                 arm_ctrl.ctrl_dual_arm_go_home()
@@ -648,6 +652,12 @@ def main(argv=None):
                 sim_state_subscriber.stop_subscribe()
         except Exception as e:
             logger_mp.error(f"Failed to stop sim state subscriber: {e}")
+
+        try:
+            if reset_pose_shm is not None:
+                reset_pose_shm.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close reset pose shm: {e}")
         
         try:
             if args.record:

@@ -69,6 +69,27 @@ class DataBuffer:
             self.data = data
 
 
+def _safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _sanitize_lowcmd_for_crc(msg, controller_name):
+    for idx, cmd in enumerate(msg.motor_cmd):
+        for field in ("q", "dq", "tau", "kp", "kd"):
+            v = getattr(cmd, field, None)
+            safe_v = _safe_float(v, 0.0)
+            if v is None:
+                logger_mp.error(f"[{controller_name}] motor_cmd[{idx}].{field} is None before CRC, force 0.0")
+            elif safe_v != v:
+                logger_mp.error(f"[{controller_name}] motor_cmd[{idx}].{field} invalid={v!r} before CRC, force 0.0")
+            setattr(cmd, field, safe_v)
+
+
 class G1_29_ArmController:
     def __init__(self, motion_mode = False, simulation_mode = False):
         logger_mp.info("Initialize G1_29_ArmController...")
@@ -119,6 +140,8 @@ class G1_29_ArmController:
             )
         self.lowstate_buffer = DataBuffer()
         self._lowstate_read_hit_logged = False
+        self._last_q = [0.0] * G1_29_Num_Motors
+        self._last_dq = [0.0] * G1_29_Num_Motors
 
         # initialize subscribe thread
         self.subscribe_thread = threading.Thread(target=self._subscribe_motor_state)
@@ -164,7 +187,7 @@ class G1_29_ArmController:
                 else:
                     self.msg.motor_cmd[id].kp = self.kp_high
                     self.msg.motor_cmd[id].kd = self.kd_high
-            self.msg.motor_cmd[id].q  = self.all_motor_q[id]
+            self.msg.motor_cmd[id].q = _safe_float(self.all_motor_q[id], 0.0)
         logger_mp.info("Lock OK!")
 
         # initialize publish thread
@@ -199,10 +222,15 @@ class G1_29_ArmController:
                             time.sleep(0.002)
                             continue
                         lowstate = G1_29_LowState()
-                        n = min(G1_29_Num_Motors, len(q), len(dq))
-                        for id in range(n):
-                            lowstate.motor_state[id].q = q[id]
-                            lowstate.motor_state[id].dq = dq[id]
+                        q_safe = list(q) if q is not None else []
+                        dq_safe = list(dq) if dq is not None else []
+                        for id in range(G1_29_Num_Motors):
+                            if id < len(q_safe) and q_safe[id] is not None:
+                                self._last_q[id] = _safe_float(q_safe[id], self._last_q[id])
+                            if id < len(dq_safe) and dq_safe[id] is not None:
+                                self._last_dq[id] = _safe_float(dq_safe[id], self._last_dq[id])
+                            lowstate.motor_state[id].q = self._last_q[id]
+                            lowstate.motor_state[id].dq = self._last_dq[id]
                         self.lowstate_buffer.SetData(lowstate)
                     except Exception as e:
                         print(f"[G1_29_ArmController] lowstate shm parse failed: {e!r}")
@@ -254,10 +282,11 @@ class G1_29_ArmController:
                 cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
 
             for idx, id in enumerate(G1_29_JointArmIndex):
-                self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
-                self.msg.motor_cmd[id].dq = 0
-                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]   
+                self.msg.motor_cmd[id].q = _safe_float(cliped_arm_q_target[idx], 0.0)
+                self.msg.motor_cmd[id].dq = 0.0
+                self.msg.motor_cmd[id].tau = _safe_float(arm_tauff_target[idx], 0.0)
 
+            _sanitize_lowcmd_for_crc(self.msg, "G1_29_ArmController")
             self.msg.crc = self.crc.Crc(self.msg)
             if self.simulation_mode and self.lowcmd_shm is not None:
                 num_cmd_motors = len(self.msg.motor_cmd)
