@@ -124,6 +124,14 @@ def build_arg_parser():
                         help='Min detection score per hand row')
     parser.add_argument('--hamer-arm-only', '--hamer_arm_only', action='store_true', dest='hamer_arm_only',
                         help='Do not drive hand from XR/HaMeR (arm only)')
+    parser.add_argument('--hamer-relative-pos', '--hamer_relative_pos', action='store_true', dest='hamer_relative_pos',
+                        help='Use first valid HaMeR wrist position as anchor; move around robot home positions')
+    parser.add_argument('--hamer-left-home', '--hamer_left_home', type=float, nargs=3, default=[0.25, 0.25, 0.1],
+                        dest='hamer_left_home', metavar=('X', 'Y', 'Z'),
+                        help='Left home position (meters) used by --hamer-relative-pos')
+    parser.add_argument('--hamer-right-home', '--hamer_right_home', type=float, nargs=3, default=[0.25, -0.25, 0.1],
+                        dest='hamer_right_home', metavar=('X', 'Y', 'Z'),
+                        help='Right home position (meters) used by --hamer-relative-pos')
     parser.add_argument('--hamer-frame-offset-json', '--hamer_frame_offset_json', type=str, default=None,
                         dest='hamer_frame_offset_json', help='Optional JSON for frame index offsets')
     parser.add_argument('--hamer-cam2base-json', '--hamer_cam2base_json', type=str, default=None,
@@ -225,7 +233,12 @@ def main(argv=None):
                 frame_offset_json=args.hamer_frame_offset_json,
                 cam2base_json=args.hamer_cam2base_json,
             )
-            hamer_adapter = HamerAdapter(WristToEEConfig.identity())
+            hamer_adapter = HamerAdapter(
+                WristToEEConfig.identity(),
+                relative_position_mode=args.hamer_relative_pos,
+                left_home=np.asarray(args.hamer_left_home, dtype=np.float64),
+                right_home=np.asarray(args.hamer_right_home, dtype=np.float64),
+            )
             hamer_hand_bridge = HamerHandBridge()
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)

@@ -15,12 +15,18 @@ class HamerAdapter:
         max_gap_frames: int = 5,
         max_step_m: float = 0.03,
         max_step_rad: float = 0.2,
+        relative_position_mode: bool = False,
+        left_home: Optional[np.ndarray] = None,
+        right_home: Optional[np.ndarray] = None,
     ):
         self.wrist_calib = wrist_calib
         self.smooth_alpha = float(smooth_alpha)
         self.max_gap_frames = int(max_gap_frames)
         self.max_step_m = float(max_step_m)
         self.max_step_rad = float(max_step_rad)
+        self.relative_position_mode = bool(relative_position_mode)
+        self.left_home = np.asarray(left_home if left_home is not None else [0.25, 0.25, 0.1], dtype=np.float64).reshape(3)
+        self.right_home = np.asarray(right_home if right_home is not None else [0.25, -0.25, 0.1], dtype=np.float64).reshape(3)
         self._gap_left = 0
         self._gap_right = 0
         self._have_left = False
@@ -29,6 +35,8 @@ class HamerAdapter:
         self._R_l = np.eye(3)
         self._p_r = np.zeros(3)
         self._R_r = np.eye(3)
+        self._anchor_l = None
+        self._anchor_r = None
 
     def _side_valid(self, side_data: Dict[str, Any]) -> bool:
         return isinstance(side_data, dict) and side_data.get("valid", False)
@@ -69,6 +77,15 @@ class HamerAdapter:
                 p_w = sd["p_wrist_base"]
                 R_w = sd["R_wrist_base"]
                 p_ee, R_ee = wrist_to_ee_target(ee_side, p_w, R_w, self.wrist_calib)
+                if self.relative_position_mode:
+                    if side_key == "left":
+                        if self._anchor_l is None:
+                            self._anchor_l = np.asarray(p_ee, dtype=np.float64).reshape(3)
+                        p_ee = self.left_home + (np.asarray(p_ee, dtype=np.float64).reshape(3) - self._anchor_l)
+                    else:
+                        if self._anchor_r is None:
+                            self._anchor_r = np.asarray(p_ee, dtype=np.float64).reshape(3)
+                        p_ee = self.right_home + (np.asarray(p_ee, dtype=np.float64).reshape(3) - self._anchor_r)
                 prev_p = getattr(self, p_attr).copy()
                 prev_R = getattr(self, R_attr).copy()
                 if getattr(self, have_attr):
