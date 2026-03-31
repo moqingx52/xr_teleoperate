@@ -257,4 +257,33 @@ def start_sim_state_subscribe(shm_name: str = "sim_state_cmd_data", shm_size: in
 #         logger_mp.warning("\nInterrupted by user")
 #     finally:
 #         subscriber.stop_subscribe()
-#         logger_mp.info("Subscriber stopped") 
+#         logger_mp.info("Subscriber stopped")
+
+
+class SimStateShmReader:
+    """Read ``isaac_sim_state`` JSON segment (no DDS). Matches SimStateDDS.input_shm in Isaac."""
+
+    def __init__(self):
+        self._shm = None
+
+    def read_data(self):
+        try:
+            from teleop.utils.isaac_shm import SHM_SIM_STATE, SIZE_SIM_STATE, try_open_shm
+
+            if self._shm is None:
+                self._shm = try_open_shm(SHM_SIM_STATE, SIZE_SIM_STATE)
+            if self._shm is None:
+                return None
+            return self._shm.read_data()
+        except Exception as e:
+            logger_mp.error(f"[SimStateShmReader] read_data failed: {e}")
+            return None
+
+    def stop_subscribe(self):
+        if self._shm is not None:
+            self._shm.close()
+            self._shm = None
+
+
+def start_sim_state_shm_reader():
+    return SimStateShmReader()

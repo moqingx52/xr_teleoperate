@@ -29,13 +29,21 @@ from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from sshkeyboard import listen_keyboard, stop_listening
 
-# for simulation
+# for simulation (non-sim uses DDS reset publisher)
 from unitree_sdk2py.core.channel import ChannelPublisher
 from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
-def publish_reset_category(category: int, publisher): # Scene Reset signal
-    msg = String_(data=str(category))
-    publisher.Write(msg)
-    logger_mp.info(f"published reset category: {category}")
+
+
+def publish_reset_category(category: int, publisher=None, reset_shm=None):
+    """Scene reset: Isaac reads ``isaac_reset_pose_cmd`` (shm) or ``rt/reset_pose/cmd`` (DDS)."""
+    if reset_shm is not None:
+        reset_shm.write_data({"reset_category": str(category)})
+        logger_mp.info(f"published reset category (shm): {category}")
+        return
+    if publisher is not None:
+        msg = String_(data=str(category))
+        publisher.Write(msg)
+        logger_mp.info(f"published reset category: {category}")
 
 # state transition
 START          = False  # Enable to start robot following VR user motion
@@ -148,14 +156,23 @@ def main(argv=None):
 
     arm_ctrl = None
     sim_state_subscriber = None
+    reset_pose_publisher = None
+    reset_pose_shm = None
     ipc_server = None
     listen_keyboard_thread = None
     try:
-        # setup dds communication domains id
-        if args.sim:
-            ChannelFactoryInitialize(1, networkInterface=args.network_interface)
-        else:
+        # Real robot: DDS domain 0. Simulation: shm for G1_23/G1_29/H1_2 + dex3/dex1; other combos still need DDS.
+        if not args.sim:
             ChannelFactoryInitialize(0, networkInterface=args.network_interface)
+        else:
+            sim_needs_dds = args.arm == "H1" or args.ee in ("inspire_dfx", "inspire_ftp", "brainco")
+            if sim_needs_dds:
+                ChannelFactoryInitialize(1, networkInterface=args.network_interface)
+                logger_mp.warning(
+                    "Simulation: this arm/EE still uses DDS in teleop; shm path covers G1_23/G1_29/H1_2 + dex3/dex1."
+                )
+            else:
+                logger_mp.info("Simulation: teleop↔Isaac via shared memory (no DDS init for this arm/EE).")
 
         # ipc communication mode. client usage: see utils/ipc.py
         if args.ipc:
@@ -300,12 +317,13 @@ def main(argv=None):
                 except psutil.AccessDenied:
                     pass
 
-        # simulation mode
+        # simulation mode: reset + sim_state via Isaac SHM (see unitree_sim_isaaclab/dds/*_dds.py)
         if args.sim:
-            reset_pose_publisher = ChannelPublisher("rt/reset_pose/cmd", String_)
-            reset_pose_publisher.Init()
-            from teleop.utils.sim_state_topic import start_sim_state_subscribe
-            sim_state_subscriber = start_sim_state_subscribe()
+            from teleop.utils.isaac_shm import SHM_RESET_POSE_CMD, SIZE_RESET_POSE, try_open_shm
+            from teleop.utils.sim_state_topic import start_sim_state_shm_reader
+
+            reset_pose_shm = try_open_shm(SHM_RESET_POSE_CMD, SIZE_RESET_POSE)
+            sim_state_subscriber = start_sim_state_shm_reader()
 
         # record + headless / non-headless mode
         if args.record:
@@ -361,7 +379,7 @@ def main(argv=None):
                     RECORD_RUNNING = False
                     recorder.save_episode()
                     if args.sim:
-                        publish_reset_category(1, reset_pose_publisher)
+                        publish_reset_category(1, publisher=reset_pose_publisher, reset_shm=reset_pose_shm)
 
             # get xr's tele data or HaMeR frame
             tele_data = None

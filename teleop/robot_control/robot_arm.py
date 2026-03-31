@@ -6,6 +6,13 @@ from enum import IntEnum
 
 import unitree_sdk2py
 
+from teleop.utils.isaac_shm import (
+    SHM_ROBOT_CMD,
+    SHM_ROBOT_STATE,
+    SIZE_ROBOT,
+    try_open_shm,
+)
+
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize # dds
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import ( LowCmd_  as hg_LowCmd, LowState_ as hg_LowState) # idl for g1, h1_2
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
@@ -61,6 +68,7 @@ class DataBuffer:
         with self.lock:
             self.data = data
 
+
 class G1_29_ArmController:
     def __init__(self, motion_mode = False, simulation_mode = False):
         logger_mp.info("Initialize G1_29_ArmController...")
@@ -83,23 +91,32 @@ class G1_29_ArmController:
         self._gradual_start_time = None
         self._gradual_time = None
 
-        if self.motion_mode:
-            self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)
+        self.lowcmd_publisher = None
+        self.lowstate_subscriber = None
+        self.lowstate_shm = None
+        self.lowcmd_shm = None
+        if self.simulation_mode:
+            self.lowstate_shm = try_open_shm(SHM_ROBOT_STATE, SIZE_ROBOT)
+            self.lowcmd_shm = try_open_shm(SHM_ROBOT_CMD, SIZE_ROBOT)
+            print("[G1_29_ArmController] simulation mode: use shared memory state/cmd")
         else:
-            self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
-        self.lowcmd_publisher.Init()
-        self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
-        self.lowstate_subscriber.Init()
-        print(
-            "[G1_29_ArmController] lowstate subscriber: "
-            f"topic={kTopicLowState!r} type={hg_LowState!r} typename={getattr(hg_LowState, '__name__', hg_LowState)}"
-        )
-        print(f"[G1_29_ArmController] runtime: python={sys.executable}")
-        print(f"[G1_29_ArmController] runtime: unitree_sdk2py={unitree_sdk2py.__file__}")
-        print(
-            "[G1_29_ArmController] runtime: "
-            f"LowState_ module={hg_LowState.__module__} LowState_={hg_LowState}"
-        )
+            if self.motion_mode:
+                self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)
+            else:
+                self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
+            self.lowcmd_publisher.Init()
+            self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
+            self.lowstate_subscriber.Init()
+            print(
+                "[G1_29_ArmController] lowstate subscriber: "
+                f"topic={kTopicLowState!r} type={hg_LowState!r} typename={getattr(hg_LowState, '__name__', hg_LowState)}"
+            )
+            print(f"[G1_29_ArmController] runtime: python={sys.executable}")
+            print(f"[G1_29_ArmController] runtime: unitree_sdk2py={unitree_sdk2py.__file__}")
+            print(
+                "[G1_29_ArmController] runtime: "
+                f"LowState_ module={hg_LowState.__module__} LowState_={hg_LowState}"
+            )
         self.lowstate_buffer = DataBuffer()
         self._lowstate_read_hit_logged = False
 
@@ -110,8 +127,14 @@ class G1_29_ArmController:
 
         while not self.lowstate_buffer.GetData():
             time.sleep(0.1)
-            logger_mp.warning("[G1_29_ArmController] Waiting to subscribe dds...")
-        logger_mp.info("[G1_29_ArmController] Subscribe dds ok.")
+            if self.simulation_mode:
+                logger_mp.warning("[G1_29_ArmController] Waiting to read lowstate shared memory...")
+            else:
+                logger_mp.warning("[G1_29_ArmController] Waiting to subscribe dds...")
+        if self.simulation_mode:
+            logger_mp.info("[G1_29_ArmController] Shared memory lowstate ready.")
+        else:
+            logger_mp.info("[G1_29_ArmController] Subscribe dds ok.")
 
         # initialize hg's lowcmd msg
         self.crc = CRC()
@@ -155,8 +178,40 @@ class G1_29_ArmController:
     def _subscribe_motor_state(self):
         _read_n = 0
         while True:
-            msg = self.lowstate_subscriber.Read()
             _read_n += 1
+            if self.simulation_mode:
+                if self.lowstate_shm is None:
+                    self.lowstate_shm = try_open_shm(SHM_ROBOT_STATE, SIZE_ROBOT)
+                    if self.lowstate_shm is None:
+                        if _read_n <= 3 or _read_n % 5000 == 0:
+                            print(f"[G1_29_ArmController] lowstate shm not ready (poll n={_read_n})")
+                        time.sleep(0.01)
+                        continue
+                msg = self.lowstate_shm.read_data() if self.lowstate_shm else None
+                if msg is not None:
+                    try:
+                        if not self._lowstate_read_hit_logged:
+                            print("[G1_29_ArmController] lowstate shm read hit")
+                            self._lowstate_read_hit_logged = True
+                        q = msg.get("joint_positions")
+                        dq = msg.get("joint_velocities")
+                        if q is None or dq is None:
+                            time.sleep(0.002)
+                            continue
+                        lowstate = G1_29_LowState()
+                        n = min(G1_29_Num_Motors, len(q), len(dq))
+                        for id in range(n):
+                            lowstate.motor_state[id].q = q[id]
+                            lowstate.motor_state[id].dq = dq[id]
+                        self.lowstate_buffer.SetData(lowstate)
+                    except Exception as e:
+                        print(f"[G1_29_ArmController] lowstate shm parse failed: {e!r}")
+                elif _read_n <= 3 or _read_n % 5000 == 0:
+                    print(f"[G1_29_ArmController] lowstate shm Read returned None (poll n={_read_n})")
+                time.sleep(0.002)
+                continue
+
+            msg = self.lowstate_subscriber.Read()
             if msg is not None:
                 try:
                     if not self._lowstate_read_hit_logged:
@@ -204,7 +259,25 @@ class G1_29_ArmController:
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]   
 
             self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            if self.simulation_mode and self.lowcmd_shm is not None:
+                num_cmd_motors = len(self.msg.motor_cmd)
+                cmd_data = {
+                    "mode_pr": int(self.msg.mode_pr),
+                    "mode_machine": int(self.msg.mode_machine),
+                    "motor_cmd": {
+                        "positions": [float(self.msg.motor_cmd[i].q) for i in range(num_cmd_motors)],
+                        "velocities": [float(self.msg.motor_cmd[i].dq) for i in range(num_cmd_motors)],
+                        "torques": [float(self.msg.motor_cmd[i].tau) for i in range(num_cmd_motors)],
+                        "kp": [float(self.msg.motor_cmd[i].kp) for i in range(num_cmd_motors)],
+                        "kd": [float(self.msg.motor_cmd[i].kd) for i in range(num_cmd_motors)],
+                    },
+                }
+                self.lowcmd_shm.write_data(cmd_data)
+            else:
+                if self.simulation_mode and self.lowcmd_shm is None:
+                    self.lowcmd_shm = try_open_shm(SHM_ROBOT_CMD, SIZE_ROBOT)
+                elif self.lowcmd_publisher is not None:
+                    self.lowcmd_publisher.Write(self.msg)
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time
@@ -225,6 +298,8 @@ class G1_29_ArmController:
 
     def get_mode_machine(self):
         '''Return current dds mode machine.'''
+        if self.simulation_mode:
+            return 0
         return self.lowstate_subscriber.Read().mode_machine
     
     def get_current_motor_q(self):
@@ -388,15 +463,24 @@ class G1_23_ArmController:
         self._gradual_start_time = None
         self._gradual_time = None
 
-        
-        if self.motion_mode:
-            self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)
+        self.lowcmd_publisher = None
+        self.lowstate_subscriber = None
+        self.lowstate_shm = None
+        self.lowcmd_shm = None
+        if self.simulation_mode:
+            self.lowstate_shm = try_open_shm(SHM_ROBOT_STATE, SIZE_ROBOT)
+            self.lowcmd_shm = try_open_shm(SHM_ROBOT_CMD, SIZE_ROBOT)
+            print("[G1_23_ArmController] simulation mode: use shared memory state/cmd")
         else:
-            self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
-        self.lowcmd_publisher.Init()
-        self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
-        self.lowstate_subscriber.Init()
+            if self.motion_mode:
+                self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)
+            else:
+                self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
+            self.lowcmd_publisher.Init()
+            self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
+            self.lowstate_subscriber.Init()
         self.lowstate_buffer = DataBuffer()
+        self._lowstate_read_hit_logged = False
 
         # initialize subscribe thread
         self.subscribe_thread = threading.Thread(target=self._subscribe_motor_state)
@@ -405,8 +489,14 @@ class G1_23_ArmController:
 
         while not self.lowstate_buffer.GetData():
             time.sleep(0.1)
-            logger_mp.warning("[G1_23_ArmController] Waiting to subscribe dds...")
-        logger_mp.info("[G1_23_ArmController] Subscribe dds ok.")
+            if self.simulation_mode:
+                logger_mp.warning("[G1_23_ArmController] Waiting to read lowstate shared memory...")
+            else:
+                logger_mp.warning("[G1_23_ArmController] Waiting to subscribe dds...")
+        if self.simulation_mode:
+            logger_mp.info("[G1_23_ArmController] Shared memory lowstate ready.")
+        else:
+            logger_mp.info("[G1_23_ArmController] Subscribe dds ok.")
 
         # initialize hg's lowcmd msg
         self.crc = CRC()
@@ -448,7 +538,33 @@ class G1_23_ArmController:
         logger_mp.info("Initialize G1_23_ArmController OK!")
 
     def _subscribe_motor_state(self):
+        _read_n = 0
         while True:
+            _read_n += 1
+            if self.simulation_mode:
+                if self.lowstate_shm is None:
+                    self.lowstate_shm = try_open_shm(SHM_ROBOT_STATE, SIZE_ROBOT)
+                    if self.lowstate_shm is None:
+                        if _read_n <= 3 or _read_n % 5000 == 0:
+                            print(f"[G1_23_ArmController] lowstate shm not ready (poll n={_read_n})")
+                        time.sleep(0.01)
+                        continue
+                msg = self.lowstate_shm.read_data()
+                if msg is not None:
+                    try:
+                        q = msg.get("joint_positions")
+                        dq = msg.get("joint_velocities")
+                        if q is not None and dq is not None:
+                            lowstate = G1_23_LowState()
+                            n = min(G1_23_Num_Motors, len(q), len(dq))
+                            for id in range(n):
+                                lowstate.motor_state[id].q = q[id]
+                                lowstate.motor_state[id].dq = dq[id]
+                            self.lowstate_buffer.SetData(lowstate)
+                    except Exception as e:
+                        print(f"[G1_23_ArmController] lowstate shm parse failed: {e!r}")
+                time.sleep(0.002)
+                continue
             msg = self.lowstate_subscriber.Read()
             if msg is not None:
                 lowstate = G1_23_LowState()
@@ -487,7 +603,25 @@ class G1_23_ArmController:
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]      
 
             self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            if self.simulation_mode and self.lowcmd_shm is not None:
+                num_cmd_motors = len(self.msg.motor_cmd)
+                cmd_data = {
+                    "mode_pr": int(self.msg.mode_pr),
+                    "mode_machine": int(self.msg.mode_machine),
+                    "motor_cmd": {
+                        "positions": [float(self.msg.motor_cmd[i].q) for i in range(num_cmd_motors)],
+                        "velocities": [float(self.msg.motor_cmd[i].dq) for i in range(num_cmd_motors)],
+                        "torques": [float(self.msg.motor_cmd[i].tau) for i in range(num_cmd_motors)],
+                        "kp": [float(self.msg.motor_cmd[i].kp) for i in range(num_cmd_motors)],
+                        "kd": [float(self.msg.motor_cmd[i].kd) for i in range(num_cmd_motors)],
+                    },
+                }
+                self.lowcmd_shm.write_data(cmd_data)
+            else:
+                if self.simulation_mode and self.lowcmd_shm is None:
+                    self.lowcmd_shm = try_open_shm(SHM_ROBOT_CMD, SIZE_ROBOT)
+                elif self.lowcmd_publisher is not None:
+                    self.lowcmd_publisher.Write(self.msg)
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time
@@ -508,6 +642,8 @@ class G1_23_ArmController:
 
     def get_mode_machine(self):
         '''Return current dds mode machine.'''
+        if self.simulation_mode:
+            return 0
         return self.lowstate_subscriber.Read().mode_machine
     
     def get_current_motor_q(self):
@@ -663,15 +799,24 @@ class H1_2_ArmController:
         self._gradual_start_time = None
         self._gradual_time = None
 
-
-        if self.motion_mode:
-            self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)
+        self.lowcmd_publisher = None
+        self.lowstate_subscriber = None
+        self.lowstate_shm = None
+        self.lowcmd_shm = None
+        if self.simulation_mode:
+            self.lowstate_shm = try_open_shm(SHM_ROBOT_STATE, SIZE_ROBOT)
+            self.lowcmd_shm = try_open_shm(SHM_ROBOT_CMD, SIZE_ROBOT)
+            print("[H1_2_ArmController] simulation mode: use shared memory state/cmd")
         else:
-            self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
-        self.lowcmd_publisher.Init()
-        self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
-        self.lowstate_subscriber.Init()
+            if self.motion_mode:
+                self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)
+            else:
+                self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
+            self.lowcmd_publisher.Init()
+            self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
+            self.lowstate_subscriber.Init()
         self.lowstate_buffer = DataBuffer()
+        self._lowstate_read_hit_logged = False
 
         # initialize subscribe thread
         self.subscribe_thread = threading.Thread(target=self._subscribe_motor_state)
@@ -680,8 +825,14 @@ class H1_2_ArmController:
 
         while not self.lowstate_buffer.GetData():
             time.sleep(0.1)
-            logger_mp.warning("[H1_2_ArmController] Waiting to subscribe dds...")
-        logger_mp.info("[H1_2_ArmController] Subscribe dds ok.")
+            if self.simulation_mode:
+                logger_mp.warning("[H1_2_ArmController] Waiting to read lowstate shared memory...")
+            else:
+                logger_mp.warning("[H1_2_ArmController] Waiting to subscribe dds...")
+        if self.simulation_mode:
+            logger_mp.info("[H1_2_ArmController] Shared memory lowstate ready.")
+        else:
+            logger_mp.info("[H1_2_ArmController] Subscribe dds ok.")
 
         # initialize hg's lowcmd msg
         self.crc = CRC()
@@ -723,7 +874,33 @@ class H1_2_ArmController:
         logger_mp.info("Initialize H1_2_ArmController OK!")
 
     def _subscribe_motor_state(self):
+        _read_n = 0
         while True:
+            _read_n += 1
+            if self.simulation_mode:
+                if self.lowstate_shm is None:
+                    self.lowstate_shm = try_open_shm(SHM_ROBOT_STATE, SIZE_ROBOT)
+                    if self.lowstate_shm is None:
+                        if _read_n <= 3 or _read_n % 5000 == 0:
+                            print(f"[H1_2_ArmController] lowstate shm not ready (poll n={_read_n})")
+                        time.sleep(0.01)
+                        continue
+                msg = self.lowstate_shm.read_data()
+                if msg is not None:
+                    try:
+                        q = msg.get("joint_positions")
+                        dq = msg.get("joint_velocities")
+                        if q is not None and dq is not None:
+                            lowstate = H1_2_LowState()
+                            n = min(H1_2_Num_Motors, len(q), len(dq))
+                            for id in range(n):
+                                lowstate.motor_state[id].q = q[id]
+                                lowstate.motor_state[id].dq = dq[id]
+                            self.lowstate_buffer.SetData(lowstate)
+                    except Exception as e:
+                        print(f"[H1_2_ArmController] lowstate shm parse failed: {e!r}")
+                time.sleep(0.002)
+                continue
             msg = self.lowstate_subscriber.Read()
             if msg is not None:
                 lowstate = H1_2_LowState()
@@ -762,7 +939,25 @@ class H1_2_ArmController:
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]      
 
             self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            if self.simulation_mode and self.lowcmd_shm is not None:
+                num_cmd_motors = len(self.msg.motor_cmd)
+                cmd_data = {
+                    "mode_pr": int(self.msg.mode_pr),
+                    "mode_machine": int(self.msg.mode_machine),
+                    "motor_cmd": {
+                        "positions": [float(self.msg.motor_cmd[i].q) for i in range(num_cmd_motors)],
+                        "velocities": [float(self.msg.motor_cmd[i].dq) for i in range(num_cmd_motors)],
+                        "torques": [float(self.msg.motor_cmd[i].tau) for i in range(num_cmd_motors)],
+                        "kp": [float(self.msg.motor_cmd[i].kp) for i in range(num_cmd_motors)],
+                        "kd": [float(self.msg.motor_cmd[i].kd) for i in range(num_cmd_motors)],
+                    },
+                }
+                self.lowcmd_shm.write_data(cmd_data)
+            else:
+                if self.simulation_mode and self.lowcmd_shm is None:
+                    self.lowcmd_shm = try_open_shm(SHM_ROBOT_CMD, SIZE_ROBOT)
+                elif self.lowcmd_publisher is not None:
+                    self.lowcmd_publisher.Write(self.msg)
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time
@@ -783,6 +978,8 @@ class H1_2_ArmController:
 
     def get_mode_machine(self):
         '''Return current dds mode machine.'''
+        if self.simulation_mode:
+            return 0
         return self.lowstate_subscriber.Read().mode_machine
     
     def get_current_motor_q(self):

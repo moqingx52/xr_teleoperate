@@ -1,5 +1,5 @@
 # for dex3-1
-from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize # dds
+from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize  # dds
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_                               # idl
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__HandCmd_
 # for gripper
@@ -23,12 +23,73 @@ from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
+from teleop.utils.isaac_shm import (
+    SHM_DEX3_CMD,
+    SHM_DEX3_STATE,
+    SHM_GRIPPER_CMD,
+    SHM_GRIPPER_STATE,
+    SIZE_DEX3,
+    SIZE_GRIPPER,
+    try_open_shm,
+)
 
 Dex3_Num_Motors = 7
 kTopicDex3LeftCommand = "rt/dex3/left/cmd"
 kTopicDex3RightCommand = "rt/dex3/right/cmd"
 kTopicDex3LeftState = "rt/dex3/left/state"
 kTopicDex3RightState = "rt/dex3/right/state"
+
+
+def _dex3_motor_cmd_dict(msg, joint_indices):
+    ids = [int(j) for j in joint_indices]
+    return {
+        "positions": [float(msg.motor_cmd[i].q) for i in ids],
+        "velocities": [float(msg.motor_cmd[i].dq) for i in ids],
+        "torques": [float(msg.motor_cmd[i].tau) for i in ids],
+        "kp": [float(msg.motor_cmd[i].kp) for i in ids],
+        "kd": [float(msg.motor_cmd[i].kd) for i in ids],
+    }
+
+
+_dex3_cmd_shm_holder = {"shm": None}
+
+
+def _write_dex3_cmd_merged(left_msg, right_msg):
+    if _dex3_cmd_shm_holder["shm"] is None:
+        _dex3_cmd_shm_holder["shm"] = try_open_shm(SHM_DEX3_CMD, SIZE_DEX3)
+    shm = _dex3_cmd_shm_holder["shm"]
+    if shm is None:
+        return
+    existing = shm.read_data() or {}
+    existing["left_hand_cmd"] = _dex3_motor_cmd_dict(left_msg, Dex3_1_Left_JointIndex)
+    existing["right_hand_cmd"] = _dex3_motor_cmd_dict(right_msg, Dex3_1_Right_JointIndex)
+    shm.write_data(existing)
+
+
+_gripper_cmd_shm_holder = {"shm": None}
+
+
+def _write_gripper_cmd_merged(left_msg, right_msg):
+    if _gripper_cmd_shm_holder["shm"] is None:
+        _gripper_cmd_shm_holder["shm"] = try_open_shm(SHM_GRIPPER_CMD, SIZE_GRIPPER)
+    shm = _gripper_cmd_shm_holder["shm"]
+    if shm is None:
+        return
+    existing = shm.read_data() or {}
+
+    def one_cmd(m):
+        c = m.cmds[0]
+        return {
+            "positions": [float(c.q)],
+            "velocities": [float(c.dq)],
+            "torques": [float(c.tau)],
+            "kp": [float(c.kp)],
+            "kd": [float(c.kd)],
+        }
+
+    existing["left_gripper_cmd"] = one_cmd(left_msg)
+    existing["right_gripper_cmd"] = one_cmd(right_msg)
+    shm.write_data(existing)
 
 
 class Dex3_1_Controller:
@@ -63,16 +124,25 @@ class Dex3_1_Controller:
         else:
             self.hand_retargeting = HandRetargeting(HandType.UNITREE_DEX3_Unit_Test)
 
-        # initialize handcmd publisher and handstate subscriber
-        self.LeftHandCmb_publisher = ChannelPublisher(kTopicDex3LeftCommand, HandCmd_)
-        self.LeftHandCmb_publisher.Init()
-        self.RightHandCmb_publisher = ChannelPublisher(kTopicDex3RightCommand, HandCmd_)
-        self.RightHandCmb_publisher.Init()
+        self._dex3_state_shm = None
+        self._dex3_hand_ready = threading.Event()
 
-        self.LeftHandState_subscriber = ChannelSubscriber(kTopicDex3LeftState, HandState_)
-        self.LeftHandState_subscriber.Init()
-        self.RightHandState_subscriber = ChannelSubscriber(kTopicDex3RightState, HandState_)
-        self.RightHandState_subscriber.Init()
+        if self.simulation_mode:
+            self.LeftHandCmb_publisher = None
+            self.RightHandCmb_publisher = None
+            self.LeftHandState_subscriber = None
+            self.RightHandState_subscriber = None
+            logger_mp.info("[Dex3_1_Controller] simulation: shm isaac_dex3_state / isaac_dex3_cmd")
+        else:
+            self.LeftHandCmb_publisher = ChannelPublisher(kTopicDex3LeftCommand, HandCmd_)
+            self.LeftHandCmb_publisher.Init()
+            self.RightHandCmb_publisher = ChannelPublisher(kTopicDex3RightCommand, HandCmd_)
+            self.RightHandCmb_publisher.Init()
+
+            self.LeftHandState_subscriber = ChannelSubscriber(kTopicDex3LeftState, HandState_)
+            self.LeftHandState_subscriber.Init()
+            self.RightHandState_subscriber = ChannelSubscriber(kTopicDex3RightState, HandState_)
+            self.RightHandState_subscriber.Init()
 
         # Shared Arrays for hand states
         self.left_hand_state_array  = Array('d', Dex3_Num_Motors, lock=True)  
@@ -84,11 +154,20 @@ class Dex3_1_Controller:
         self.subscribe_state_thread.start()
 
         while True:
-            if any(self.left_hand_state_array) and any(self.right_hand_state_array):
+            if self.simulation_mode:
+                if self._dex3_hand_ready.is_set():
+                    break
+            elif any(self.left_hand_state_array) and any(self.right_hand_state_array):
                 break
             time.sleep(0.01)
-            logger_mp.warning("[Dex3_1_Controller] Waiting to subscribe dds...")
-        logger_mp.info("[Dex3_1_Controller] Subscribe dds ok.")
+            if self.simulation_mode:
+                logger_mp.warning("[Dex3_1_Controller] Waiting for dex3 state shared memory...")
+            else:
+                logger_mp.warning("[Dex3_1_Controller] Waiting to subscribe dds...")
+        if self.simulation_mode:
+            logger_mp.info("[Dex3_1_Controller] Dex3 state shm ready.")
+        else:
+            logger_mp.info("[Dex3_1_Controller] Subscribe dds ok.")
 
         hand_control_process = Process(target=self.control_process, args=(left_hand_array_in, right_hand_array_in,  self.left_hand_state_array, self.right_hand_state_array,
                                                                           dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out))
@@ -99,15 +178,27 @@ class Dex3_1_Controller:
 
     def _subscribe_hand_state(self):
         while True:
-            left_hand_msg  = self.LeftHandState_subscriber.Read()
-            right_hand_msg = self.RightHandState_subscriber.Read()
-            if left_hand_msg is not None and right_hand_msg is not None:
-                # Update left hand state
-                for idx, id in enumerate(Dex3_1_Left_JointIndex):
-                    self.left_hand_state_array[idx] = left_hand_msg.motor_state[id].q
-                # Update right hand state
-                for idx, id in enumerate(Dex3_1_Right_JointIndex):
-                    self.right_hand_state_array[idx] = right_hand_msg.motor_state[id].q
+            if self.simulation_mode:
+                if self._dex3_state_shm is None:
+                    self._dex3_state_shm = try_open_shm(SHM_DEX3_STATE, SIZE_DEX3)
+                st = self._dex3_state_shm.read_data() if self._dex3_state_shm else None
+                if st and "left_hand" in st and "right_hand" in st:
+                    lp = st["left_hand"].get("positions") or []
+                    rp = st["right_hand"].get("positions") or []
+                    if len(lp) >= Dex3_Num_Motors and len(rp) >= Dex3_Num_Motors:
+                        for idx, jid in enumerate(Dex3_1_Left_JointIndex):
+                            self.left_hand_state_array[idx] = lp[int(jid)]
+                        for idx, jid in enumerate(Dex3_1_Right_JointIndex):
+                            self.right_hand_state_array[idx] = rp[int(jid)]
+                        self._dex3_hand_ready.set()
+            else:
+                left_hand_msg  = self.LeftHandState_subscriber.Read()
+                right_hand_msg = self.RightHandState_subscriber.Read()
+                if left_hand_msg is not None and right_hand_msg is not None:
+                    for idx, id in enumerate(Dex3_1_Left_JointIndex):
+                        self.left_hand_state_array[idx] = left_hand_msg.motor_state[id].q
+                    for idx, id in enumerate(Dex3_1_Right_JointIndex):
+                        self.right_hand_state_array[idx] = right_hand_msg.motor_state[id].q
             time.sleep(0.002)
     
     class _RIS_Mode:
@@ -130,8 +221,11 @@ class Dex3_1_Controller:
         for idx, id in enumerate(Dex3_1_Right_JointIndex):
             self.right_msg.motor_cmd[id].q = right_q_target[idx]
 
-        self.LeftHandCmb_publisher.Write(self.left_msg)
-        self.RightHandCmb_publisher.Write(self.right_msg)
+        if self.simulation_mode:
+            _write_dex3_cmd_merged(self.left_msg, self.right_msg)
+        else:
+            self.LeftHandCmb_publisher.Write(self.left_msg)
+            self.RightHandCmb_publisher.Write(self.right_msg)
         # logger_mp.debug("hand ctrl publish ok.")
     
     def control_process(self, left_hand_array_in, right_hand_array_in, left_hand_state_array, right_hand_state_array,
@@ -258,22 +352,29 @@ class Dex1_1_Gripper_Controller:
         self.Unit_Test = Unit_Test
         self.gripper_sub_ready = False
         self.simulation_mode = simulation_mode
-        
+        self._gripper_state_shm = None
+
         if filter and not self.simulation_mode:
             self.smooth_filter = WeightedMovingFilter(np.array([0.5, 0.3, 0.2]), 2)
         else:
             self.smooth_filter = None
- 
-        # initialize handcmd publisher and handstate subscriber
-        self.LeftGripperCmb_publisher = ChannelPublisher(kTopicGripperLeftCommand, MotorCmds_)
-        self.LeftGripperCmb_publisher.Init()
-        self.RightGripperCmb_publisher = ChannelPublisher(kTopicGripperRightCommand, MotorCmds_)
-        self.RightGripperCmb_publisher.Init()
 
-        self.LeftGripperState_subscriber = ChannelSubscriber(kTopicGripperLeftState, MotorStates_)
-        self.LeftGripperState_subscriber.Init()
-        self.RightGripperState_subscriber = ChannelSubscriber(kTopicGripperRightState, MotorStates_)
-        self.RightGripperState_subscriber.Init()
+        if self.simulation_mode:
+            self.LeftGripperCmb_publisher = None
+            self.RightGripperCmb_publisher = None
+            self.LeftGripperState_subscriber = None
+            self.RightGripperState_subscriber = None
+            logger_mp.info("[Dex1_1_Gripper_Controller] simulation: shm isaac_gripper_state / isaac_gripper_cmd")
+        else:
+            self.LeftGripperCmb_publisher = ChannelPublisher(kTopicGripperLeftCommand, MotorCmds_)
+            self.LeftGripperCmb_publisher.Init()
+            self.RightGripperCmb_publisher = ChannelPublisher(kTopicGripperRightCommand, MotorCmds_)
+            self.RightGripperCmb_publisher.Init()
+
+            self.LeftGripperState_subscriber = ChannelSubscriber(kTopicGripperLeftState, MotorStates_)
+            self.LeftGripperState_subscriber.Init()
+            self.RightGripperState_subscriber = ChannelSubscriber(kTopicGripperRightState, MotorStates_)
+            self.RightGripperState_subscriber.Init()
 
         # Shared Arrays for gripper states
         self.left_gripper_state_value = Value('d', 0.0, lock=True)
@@ -286,8 +387,14 @@ class Dex1_1_Gripper_Controller:
 
         while not self.gripper_sub_ready:
             time.sleep(0.01)
-            logger_mp.warning("[Dex1_1_Gripper_Controller] Waiting to subscribe dds...")
-        logger_mp.info("[Dex1_1_Gripper_Controller] Subscribe dds ok.")
+            if self.simulation_mode:
+                logger_mp.warning("[Dex1_1_Gripper_Controller] Waiting for gripper state shared memory...")
+            else:
+                logger_mp.warning("[Dex1_1_Gripper_Controller] Waiting to subscribe dds...")
+        if self.simulation_mode:
+            logger_mp.info("[Dex1_1_Gripper_Controller] Gripper state shm ready.")
+        else:
+            logger_mp.info("[Dex1_1_Gripper_Controller] Subscribe dds ok.")
 
         self.gripper_control_thread = threading.Thread(target=self.control_thread, args=(left_gripper_value_in, right_gripper_value_in, self.left_gripper_state_value, self.right_gripper_state_value,
                                                                                          dual_gripper_data_lock, dual_gripper_state_out, dual_gripper_action_out))
@@ -298,12 +405,24 @@ class Dex1_1_Gripper_Controller:
 
     def _subscribe_gripper_state(self):
         while True:
-            left_gripper_msg  = self.LeftGripperState_subscriber.Read()
-            right_gripper_msg  = self.RightGripperState_subscriber.Read()
-            self.gripper_sub_ready = True
-            if left_gripper_msg is not None and right_gripper_msg is not None:
-                self.left_gripper_state_value.value = left_gripper_msg.states[0].q
-                self.right_gripper_state_value.value = right_gripper_msg.states[0].q
+            if self.simulation_mode:
+                if self._gripper_state_shm is None:
+                    self._gripper_state_shm = try_open_shm(SHM_GRIPPER_STATE, SIZE_GRIPPER)
+                st = self._gripper_state_shm.read_data() if self._gripper_state_shm else None
+                if st and "left_hand" in st and "right_hand" in st:
+                    lp = st["left_hand"].get("positions") or []
+                    rp = st["right_hand"].get("positions") or []
+                    if len(lp) >= 1 and len(rp) >= 1:
+                        self.left_gripper_state_value.value = float(lp[0])
+                        self.right_gripper_state_value.value = float(rp[0])
+                        self.gripper_sub_ready = True
+            else:
+                left_gripper_msg  = self.LeftGripperState_subscriber.Read()
+                right_gripper_msg  = self.RightGripperState_subscriber.Read()
+                self.gripper_sub_ready = True
+                if left_gripper_msg is not None and right_gripper_msg is not None:
+                    self.left_gripper_state_value.value = left_gripper_msg.states[0].q
+                    self.right_gripper_state_value.value = right_gripper_msg.states[0].q
             time.sleep(0.002)
     
     def ctrl_dual_gripper(self, dual_gripper_action):
@@ -311,8 +430,11 @@ class Dex1_1_Gripper_Controller:
         self.left_gripper_msg.cmds[0].q  = dual_gripper_action[0]
         self.right_gripper_msg.cmds[0].q = dual_gripper_action[1]
 
-        self.LeftGripperCmb_publisher.Write(self.left_gripper_msg)
-        self.RightGripperCmb_publisher.Write(self.right_gripper_msg)
+        if self.simulation_mode:
+            _write_gripper_cmd_merged(self.left_gripper_msg, self.right_gripper_msg)
+        else:
+            self.LeftGripperCmb_publisher.Write(self.left_gripper_msg)
+            self.RightGripperCmb_publisher.Write(self.right_gripper_msg)
         # logger_mp.debug("gripper ctrl publish ok.")
     
     def control_thread(self, left_gripper_value_in, right_gripper_value_in, left_gripper_state_value, right_gripper_state_value, dual_hand_data_lock = None, 
