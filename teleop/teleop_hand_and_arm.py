@@ -166,11 +166,11 @@ def main(argv=None):
         if not args.sim:
             ChannelFactoryInitialize(0, networkInterface=args.network_interface)
         else:
-            sim_needs_dds = args.arm == "H1" or args.ee in ("inspire_dfx", "inspire_ftp", "brainco")
+            sim_needs_dds = args.arm == "H1" or args.ee in ("brainco",)
             if sim_needs_dds:
                 ChannelFactoryInitialize(1, networkInterface=args.network_interface)
                 logger_mp.warning(
-                    "Simulation: this arm/EE still uses DDS in teleop; shm path covers G1_23/G1_29/H1_2 + dex3/dex1."
+                    "Simulation: this arm/EE still uses DDS in teleop; shm path covers G1_23/G1_29/H1_2 + dex3/dex1/inspire."
                 )
             else:
                 logger_mp.info("Simulation: teleop↔Isaac via shared memory (no DDS init for this arm/EE).")
@@ -197,6 +197,7 @@ def main(argv=None):
         tv_wrapper = None
         hamer_input = None
         hamer_adapter = None
+        hamer_hand_bridge = None
         last_hamer_left_tf = np.eye(4, dtype=np.float64)
         last_hamer_left_tf[:3, 3] = np.array([0.25, 0.25, 0.1], dtype=np.float64)
         last_hamer_right_tf = np.eye(4, dtype=np.float64)
@@ -214,6 +215,7 @@ def main(argv=None):
         else:
             from teleop.input_source.hamer_input import HamerInputSource
             from teleop.input_source.hamer_adapter import HamerAdapter
+            from teleop.input_source.hamer_bridge import HamerHandBridge
             from teleop.input_source.hamer_to_robot_frame import WristToEEConfig
 
             hamer_input = HamerInputSource(
@@ -224,6 +226,7 @@ def main(argv=None):
                 cam2base_json=args.hamer_cam2base_json,
             )
             hamer_adapter = HamerAdapter(WristToEEConfig.identity())
+            hamer_hand_bridge = HamerHandBridge()
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.motion:
@@ -394,8 +397,7 @@ def main(argv=None):
                     STOP = True
                     break
 
-            # HaMeR 首版不接 XR/JSON 手指；--hamer-arm-only 显式关闭手部跟随（与 XR 并用时预留）
-            skip_hand_tele = args.input_source == "hamer" or args.hamer_arm_only
+            skip_hand_tele = args.hamer_arm_only
             if (
                 tele_data is not None
                 and (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco")
@@ -406,6 +408,18 @@ def main(argv=None):
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
                     right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
+            elif (
+                args.input_source == "hamer"
+                and hamer_frame is not None
+                and (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco")
+                and args.input_mode == "hand"
+                and not skip_hand_tele
+            ):
+                left_hand_pos, right_hand_pos = hamer_hand_bridge.step(hamer_frame)
+                with left_hand_pos_array.get_lock():
+                    left_hand_pos_array[:] = left_hand_pos.flatten()
+                with right_hand_pos_array.get_lock():
+                    right_hand_pos_array[:] = right_hand_pos.flatten()
             elif tele_data is not None and args.ee == "dex1" and args.input_mode == "controller":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue

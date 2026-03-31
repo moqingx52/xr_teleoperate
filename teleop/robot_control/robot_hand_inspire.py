@@ -2,6 +2,12 @@ from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, Cha
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_                           # idl
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
 from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
+from teleop.utils.isaac_shm import (
+    SHM_INSPIRE_CMD,
+    SHM_INSPIRE_STATE,
+    SIZE_INSPIRE,
+    try_open_shm,
+)
 import numpy as np
 from enum import IntEnum
 import threading
@@ -14,6 +20,15 @@ logger_mp = logging_mp.getLogger(__name__)
 Inspire_Num_Motors = 6
 kTopicInspireDFXCommand = "rt/inspire/cmd"
 kTopicInspireDFXState = "rt/inspire/state"
+
+
+def _denormalize_inspire(idx: int, norm_val: float) -> float:
+    n = float(np.clip(norm_val, 0.0, 1.0))
+    if idx <= 3:
+        return (1.0 - n) * 1.7
+    if idx == 4:
+        return (1.0 - n) * 0.5
+    return (1.0 - n) * 1.4 - 0.1
 
 class Inspire_Controller_DFX:
     def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock = None, dual_hand_state_array = None,
@@ -28,12 +43,20 @@ class Inspire_Controller_DFX:
             self.hand_retargeting = HandRetargeting(HandType.INSPIRE_HAND_Unit_Test)
 
 
-        # initialize handcmd publisher and handstate subscriber
-        self.HandCmb_publisher = ChannelPublisher(kTopicInspireDFXCommand, MotorCmds_)
-        self.HandCmb_publisher.Init()
-
-        self.HandState_subscriber = ChannelSubscriber(kTopicInspireDFXState, MotorStates_)
-        self.HandState_subscriber.Init()
+        self.HandCmb_publisher = None
+        self.HandState_subscriber = None
+        self.inspire_state_shm = None
+        self.inspire_cmd_shm = None
+        if self.simulation_mode:
+            self.inspire_state_shm = try_open_shm(SHM_INSPIRE_STATE, SIZE_INSPIRE)
+            self.inspire_cmd_shm = try_open_shm(SHM_INSPIRE_CMD, SIZE_INSPIRE)
+            logger_mp.info("[Inspire_Controller_DFX] simulation mode: use shared memory state/cmd")
+        else:
+            # initialize handcmd publisher and handstate subscriber
+            self.HandCmb_publisher = ChannelPublisher(kTopicInspireDFXCommand, MotorCmds_)
+            self.HandCmb_publisher.Init()
+            self.HandState_subscriber = ChannelSubscriber(kTopicInspireDFXState, MotorStates_)
+            self.HandState_subscriber.Init()
 
         # Shared Arrays for hand states
         self.left_hand_state_array  = Array('d', Inspire_Num_Motors, lock=True)  
@@ -48,8 +71,14 @@ class Inspire_Controller_DFX:
             if any(self.right_hand_state_array): # any(self.left_hand_state_array) and 
                 break
             time.sleep(0.01)
-            logger_mp.warning("[Inspire_Controller_DFX] Waiting to subscribe dds...")
-        logger_mp.info("[Inspire_Controller_DFX] Subscribe dds ok.")
+            if self.simulation_mode:
+                logger_mp.warning("[Inspire_Controller_DFX] Waiting to read inspire shared memory...")
+            else:
+                logger_mp.warning("[Inspire_Controller_DFX] Waiting to subscribe dds...")
+        if self.simulation_mode:
+            logger_mp.info("[Inspire_Controller_DFX] Shared memory inspire state ready.")
+        else:
+            logger_mp.info("[Inspire_Controller_DFX] Subscribe dds ok.")
 
         hand_control_process = Process(target=self.control_process, args=(left_hand_array, right_hand_array,  self.left_hand_state_array, self.right_hand_state_array,
                                                                           dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array))
@@ -60,12 +89,34 @@ class Inspire_Controller_DFX:
 
     def _subscribe_hand_state(self):
         while True:
-            hand_msg  = self.HandState_subscriber.Read()
-            if hand_msg is not None:
-                for idx, id in enumerate(Inspire_Left_Hand_JointIndex):
-                    self.left_hand_state_array[idx] = hand_msg.states[id].q
-                for idx, id in enumerate(Inspire_Right_Hand_JointIndex):
-                    self.right_hand_state_array[idx] = hand_msg.states[id].q
+            if self.simulation_mode:
+                if self.inspire_state_shm is None:
+                    self.inspire_state_shm = try_open_shm(SHM_INSPIRE_STATE, SIZE_INSPIRE)
+                    time.sleep(0.01)
+                    continue
+                msg = self.inspire_state_shm.read_data()
+                if msg is not None:
+                    q = msg.get("positions", [])
+                    for i in range(Inspire_Num_Motors):
+                        q_l = float(q[i + 6]) if i + 6 < len(q) else 0.0
+                        q_r = float(q[i]) if i < len(q) else 0.0
+                        # align with DDS normalized state q in [0,1]
+                        if i <= 3:
+                            self.left_hand_state_array[i] = np.clip((1.7 - q_l) / 1.7, 0.0, 1.0)
+                            self.right_hand_state_array[i] = np.clip((1.7 - q_r) / 1.7, 0.0, 1.0)
+                        elif i == 4:
+                            self.left_hand_state_array[i] = np.clip((0.5 - q_l) / 0.5, 0.0, 1.0)
+                            self.right_hand_state_array[i] = np.clip((0.5 - q_r) / 0.5, 0.0, 1.0)
+                        else:
+                            self.left_hand_state_array[i] = np.clip((1.3 - q_l) / 1.4, 0.0, 1.0)
+                            self.right_hand_state_array[i] = np.clip((1.3 - q_r) / 1.4, 0.0, 1.0)
+            else:
+                hand_msg  = self.HandState_subscriber.Read()
+                if hand_msg is not None:
+                    for idx, id in enumerate(Inspire_Left_Hand_JointIndex):
+                        self.left_hand_state_array[idx] = hand_msg.states[id].q
+                    for idx, id in enumerate(Inspire_Right_Hand_JointIndex):
+                        self.right_hand_state_array[idx] = hand_msg.states[id].q
             time.sleep(0.002)
 
     def ctrl_dual_hand(self, left_q_target, right_q_target):
@@ -77,7 +128,19 @@ class Inspire_Controller_DFX:
         for idx, id in enumerate(Inspire_Right_Hand_JointIndex):             
             self.hand_msg.cmds[id].q = right_q_target[idx] 
 
-        self.HandCmb_publisher.Write(self.hand_msg)
+        if self.simulation_mode and self.inspire_cmd_shm is not None:
+            right_pos = [_denormalize_inspire(i, right_q_target[i]) for i in range(Inspire_Num_Motors)]
+            left_pos = [_denormalize_inspire(i, left_q_target[i]) for i in range(Inspire_Num_Motors)]
+            cmd_data = {
+                "positions": [float(v) for v in (right_pos + left_pos)],
+                "velocities": [0.0] * (Inspire_Num_Motors * 2),
+                "torques": [0.0] * (Inspire_Num_Motors * 2),
+                "kp": [0.0] * (Inspire_Num_Motors * 2),
+                "kd": [0.0] * (Inspire_Num_Motors * 2),
+            }
+            self.inspire_cmd_shm.write_data(cmd_data)
+        else:
+            self.HandCmb_publisher.Write(self.hand_msg)
         # logger_mp.debug("hand ctrl publish ok.")
     
     def control_process(self, left_hand_array, right_hand_array, left_hand_state_array, right_hand_state_array,
@@ -162,8 +225,12 @@ class Inspire_Controller_FTP:
     def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock = None, dual_hand_state_array = None,
                        dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False):
         logger_mp.info("Initialize Inspire_Controller_FTP...")
-        from inspire_sdkpy import inspire_dds  # lazy import
-        import inspire_sdkpy.inspire_hand_defaut as inspire_hand_default
+        inspire_dds = None
+        self.inspire_hand_default = None
+        if not simulation_mode:
+            from inspire_sdkpy import inspire_dds  # lazy import
+            import inspire_sdkpy.inspire_hand_defaut as inspire_hand_default
+            self.inspire_hand_default = inspire_hand_default
         self.fps = fps
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
@@ -173,17 +240,28 @@ class Inspire_Controller_FTP:
             self.hand_retargeting = HandRetargeting(HandType.INSPIRE_HAND_Unit_Test)
 
 
-        # Initialize hand command publishers
-        self.LeftHandCmd_publisher = ChannelPublisher(kTopicInspireFTPLeftCommand, inspire_dds.inspire_hand_ctrl)
-        self.LeftHandCmd_publisher.Init()
-        self.RightHandCmd_publisher = ChannelPublisher(kTopicInspireFTPRightCommand, inspire_dds.inspire_hand_ctrl)
-        self.RightHandCmd_publisher.Init()
+        self.LeftHandCmd_publisher = None
+        self.RightHandCmd_publisher = None
+        self.LeftHandState_subscriber = None
+        self.RightHandState_subscriber = None
+        self.inspire_state_shm = None
+        self.inspire_cmd_shm = None
+        if self.simulation_mode:
+            self.inspire_state_shm = try_open_shm(SHM_INSPIRE_STATE, SIZE_INSPIRE)
+            self.inspire_cmd_shm = try_open_shm(SHM_INSPIRE_CMD, SIZE_INSPIRE)
+            logger_mp.info("[Inspire_Controller_FTP] simulation mode: use shared memory state/cmd")
+        else:
+            # Initialize hand command publishers
+            self.LeftHandCmd_publisher = ChannelPublisher(kTopicInspireFTPLeftCommand, inspire_dds.inspire_hand_ctrl)
+            self.LeftHandCmd_publisher.Init()
+            self.RightHandCmd_publisher = ChannelPublisher(kTopicInspireFTPRightCommand, inspire_dds.inspire_hand_ctrl)
+            self.RightHandCmd_publisher.Init()
 
-        # Initialize hand state subscribers
-        self.LeftHandState_subscriber = ChannelSubscriber(kTopicInspireFTPLeftState, inspire_dds.inspire_hand_state)
-        self.LeftHandState_subscriber.Init() # Consider using callback if preferred: Init(callback_func, period_ms)
-        self.RightHandState_subscriber = ChannelSubscriber(kTopicInspireFTPRightState, inspire_dds.inspire_hand_state)
-        self.RightHandState_subscriber.Init()
+            # Initialize hand state subscribers
+            self.LeftHandState_subscriber = ChannelSubscriber(kTopicInspireFTPLeftState, inspire_dds.inspire_hand_state)
+            self.LeftHandState_subscriber.Init()
+            self.RightHandState_subscriber = ChannelSubscriber(kTopicInspireFTPRightState, inspire_dds.inspire_hand_state)
+            self.RightHandState_subscriber.Init()
 
         # Shared Arrays for hand states ([0,1] normalized values)
         self.left_hand_state_array  = Array('d', Inspire_Num_Motors, lock=True)
@@ -198,7 +276,10 @@ class Inspire_Controller_FTP:
         wait_count = 0
         while not (any(self.left_hand_state_array) or any(self.right_hand_state_array)):
             if wait_count % 100 == 0: # Print every second
-                logger_mp.info(f"[Inspire_Controller_FTP] Waiting to subscribe to hand states from DDS (L: {any(self.left_hand_state_array)}, R: {any(self.right_hand_state_array)})...")
+                if self.simulation_mode:
+                    logger_mp.info(f"[Inspire_Controller_FTP] Waiting to read hand states from SHM (L: {any(self.left_hand_state_array)}, R: {any(self.right_hand_state_array)})...")
+                else:
+                    logger_mp.info(f"[Inspire_Controller_FTP] Waiting to subscribe to hand states from DDS (L: {any(self.left_hand_state_array)}, R: {any(self.right_hand_state_array)})...")
             time.sleep(0.01)
             wait_count += 1
             if wait_count > 500: # Timeout after 5 seconds
@@ -216,24 +297,54 @@ class Inspire_Controller_FTP:
     def _subscribe_hand_state(self):
         logger_mp.info("[Inspire_Controller_FTP] Subscribe thread started.")
         while True:
-            # Left Hand
-            left_state_msg = self.LeftHandState_subscriber.Read()
-            if left_state_msg is not None:
-                if hasattr(left_state_msg, 'angle_act') and len(left_state_msg.angle_act) == Inspire_Num_Motors:
-                    with self.left_hand_state_array.get_lock():
+            if self.simulation_mode:
+                if self.inspire_state_shm is None:
+                    self.inspire_state_shm = try_open_shm(SHM_INSPIRE_STATE, SIZE_INSPIRE)
+                    time.sleep(0.01)
+                    continue
+                msg = self.inspire_state_shm.read_data()
+                if msg is not None:
+                    q = msg.get("positions", [])
+                    with self.left_hand_state_array.get_lock(), self.right_hand_state_array.get_lock():
                         for i in range(Inspire_Num_Motors):
-                            self.left_hand_state_array[i] = left_state_msg.angle_act[i] / 1000.0
-                else:
-                    logger_mp.warning(f"[Inspire_Controller_FTP] Received left_state_msg but attributes are missing or incorrect. Type: {type(left_state_msg)}, Content: {str(left_state_msg)[:100]}")
-            # Right Hand
-            right_state_msg = self.RightHandState_subscriber.Read()
-            if right_state_msg is not None:
-                if hasattr(right_state_msg, 'angle_act') and len(right_state_msg.angle_act) == Inspire_Num_Motors:
-                    with self.right_hand_state_array.get_lock():
-                        for i in range(Inspire_Num_Motors):
-                            self.right_hand_state_array[i] = right_state_msg.angle_act[i] / 1000.0
-                else:
-                    logger_mp.warning(f"[Inspire_Controller_FTP] Received right_state_msg but attributes are missing or incorrect. Type: {type(right_state_msg)}, Content: {str(right_state_msg)[:100]}")
+                            if i + 6 < len(q):
+                                q_l = float(q[i + 6])
+                                if i <= 3:
+                                    self.left_hand_state_array[i] = np.clip((1.7 - q_l) / 1.7, 0.0, 1.0)
+                                elif i == 4:
+                                    self.left_hand_state_array[i] = np.clip((0.5 - q_l) / 0.5, 0.0, 1.0)
+                                else:
+                                    self.left_hand_state_array[i] = np.clip((1.3 - q_l) / 1.4, 0.0, 1.0)
+                            else:
+                                self.left_hand_state_array[i] = 0.0
+
+                            if i < len(q):
+                                q_r = float(q[i])
+                                if i <= 3:
+                                    self.right_hand_state_array[i] = np.clip((1.7 - q_r) / 1.7, 0.0, 1.0)
+                                elif i == 4:
+                                    self.right_hand_state_array[i] = np.clip((0.5 - q_r) / 0.5, 0.0, 1.0)
+                                else:
+                                    self.right_hand_state_array[i] = np.clip((1.3 - q_r) / 1.4, 0.0, 1.0)
+                            else:
+                                self.right_hand_state_array[i] = 0.0
+            else:
+                left_state_msg = self.LeftHandState_subscriber.Read()
+                if left_state_msg is not None:
+                    if hasattr(left_state_msg, 'angle_act') and len(left_state_msg.angle_act) == Inspire_Num_Motors:
+                        with self.left_hand_state_array.get_lock():
+                            for i in range(Inspire_Num_Motors):
+                                self.left_hand_state_array[i] = left_state_msg.angle_act[i] / 1000.0
+                    else:
+                        logger_mp.warning(f"[Inspire_Controller_FTP] Received left_state_msg but attributes are missing or incorrect. Type: {type(left_state_msg)}, Content: {str(left_state_msg)[:100]}")
+                right_state_msg = self.RightHandState_subscriber.Read()
+                if right_state_msg is not None:
+                    if hasattr(right_state_msg, 'angle_act') and len(right_state_msg.angle_act) == Inspire_Num_Motors:
+                        with self.right_hand_state_array.get_lock():
+                            for i in range(Inspire_Num_Motors):
+                                self.right_hand_state_array[i] = right_state_msg.angle_act[i] / 1000.0
+                    else:
+                        logger_mp.warning(f"[Inspire_Controller_FTP] Received right_state_msg but attributes are missing or incorrect. Type: {type(right_state_msg)}, Content: {str(right_state_msg)[:100]}")
 
             time.sleep(0.002)
 
@@ -241,17 +352,31 @@ class Inspire_Controller_FTP:
         """
         Send scaled angle commands [0-1000] to both hands.
         """
-        # Left Hand Command
-        left_cmd_msg = inspire_hand_default.get_inspire_hand_ctrl()
-        left_cmd_msg.angle_set = left_angle_cmd_scaled
-        left_cmd_msg.mode = 0b0001 # Mode 1: Angle control
-        self.LeftHandCmd_publisher.Write(left_cmd_msg)
+        if self.simulation_mode and self.inspire_cmd_shm is not None:
+            left_norm = [float(np.clip(v / 1000.0, 0.0, 1.0)) for v in left_angle_cmd_scaled]
+            right_norm = [float(np.clip(v / 1000.0, 0.0, 1.0)) for v in right_angle_cmd_scaled]
+            right_pos = [_denormalize_inspire(i, right_norm[i]) for i in range(Inspire_Num_Motors)]
+            left_pos = [_denormalize_inspire(i, left_norm[i]) for i in range(Inspire_Num_Motors)]
+            cmd_data = {
+                "positions": [float(v) for v in right_pos + left_pos],
+                "velocities": [0.0] * (Inspire_Num_Motors * 2),
+                "torques": [0.0] * (Inspire_Num_Motors * 2),
+                "kp": [0.0] * (Inspire_Num_Motors * 2),
+                "kd": [0.0] * (Inspire_Num_Motors * 2),
+            }
+            self.inspire_cmd_shm.write_data(cmd_data)
+        else:
+            # Left Hand Command
+            left_cmd_msg = self.inspire_hand_default.get_inspire_hand_ctrl()
+            left_cmd_msg.angle_set = left_angle_cmd_scaled
+            left_cmd_msg.mode = 0b0001 # Mode 1: Angle control
+            self.LeftHandCmd_publisher.Write(left_cmd_msg)
 
-        # Right Hand Command
-        right_cmd_msg = inspire_hand_default.get_inspire_hand_ctrl()
-        right_cmd_msg.angle_set = right_angle_cmd_scaled
-        right_cmd_msg.mode = 0b0001 # Mode 1: Angle control
-        self.RightHandCmd_publisher.Write(right_cmd_msg)
+            # Right Hand Command
+            right_cmd_msg = self.inspire_hand_default.get_inspire_hand_ctrl()
+            right_cmd_msg.angle_set = right_angle_cmd_scaled
+            right_cmd_msg.mode = 0b0001 # Mode 1: Angle control
+            self.RightHandCmd_publisher.Write(right_cmd_msg)
 
         # 临时打开前 N 次的 log
         if not hasattr(self, "_debug_count"):

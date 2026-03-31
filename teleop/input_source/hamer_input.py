@@ -188,6 +188,7 @@ class HamerJsonReader:
                 "R_wrist_base": R,
                 "hand_pose": np.asarray(rec.get("hand_pose", []), dtype=np.float64).reshape(-1),
                 "global_orient": np.asarray(rec.get("global_orient", []), dtype=np.float64).reshape(-1),
+                "keypoints_3d_local": np.asarray(rec.get("keypoints_3d_local", []), dtype=np.float64).reshape(-1, 3),
                 "score": score,
             }
 
