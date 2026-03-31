@@ -142,6 +142,7 @@ class G1_29_ArmController:
         self._lowstate_read_hit_logged = False
         self._last_q = [0.0] * G1_29_Num_Motors
         self._last_dq = [0.0] * G1_29_Num_Motors
+        self._sim_lowstate_none_count = 0
 
         # initialize subscribe thread
         self.subscribe_thread = threading.Thread(target=self._subscribe_motor_state)
@@ -212,6 +213,7 @@ class G1_29_ArmController:
                         continue
                 msg = self.lowstate_shm.read_data() if self.lowstate_shm else None
                 if msg is not None:
+                    self._sim_lowstate_none_count = 0
                     try:
                         if not self._lowstate_read_hit_logged:
                             print("[G1_29_ArmController] lowstate shm read hit")
@@ -236,6 +238,17 @@ class G1_29_ArmController:
                         print(f"[G1_29_ArmController] lowstate shm parse failed: {e!r}")
                 elif _read_n <= 3 or _read_n % 5000 == 0:
                     print(f"[G1_29_ArmController] lowstate shm Read returned None (poll n={_read_n})")
+                    self._sim_lowstate_none_count += 1
+                    if self._sim_lowstate_none_count >= 500:
+                        # Recover from stale/broken shm attachment without restarting Isaac.
+                        print("[G1_29_ArmController] lowstate shm stalled; reconnecting...")
+                        try:
+                            if self.lowstate_shm is not None:
+                                self.lowstate_shm.close()
+                        except Exception:
+                            pass
+                        self.lowstate_shm = None
+                        self._sim_lowstate_none_count = 0
                 time.sleep(0.002)
                 continue
 

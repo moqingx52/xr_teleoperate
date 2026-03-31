@@ -7,6 +7,7 @@ import json
 import threading
 import time
 from multiprocessing import shared_memory
+from multiprocessing import resource_tracker
 from typing import Any, Dict, Optional
 
 # Names/sizes must match unitree_sim_isaaclab/dds/*.py
@@ -41,6 +42,12 @@ class IsaacJsonShm:
         self.size = size
         self.lock = threading.RLock()
         self.shm = shared_memory.SharedMemory(name=name)
+        # Attach-only consumer: do not let resource_tracker unlink segments
+        # owned by Isaac publisher process at interpreter shutdown.
+        try:
+            resource_tracker.unregister(self.shm._name, "shared_memory")
+        except Exception:
+            pass
 
     def read_data(self) -> Optional[Dict[str, Any]]:
         try:
