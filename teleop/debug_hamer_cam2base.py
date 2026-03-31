@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -86,13 +86,28 @@ def _print_segment_stats(name: str, arr: np.ndarray) -> None:
     print(f"  last   = {_fmt_vec(np.mean(c, axis=0))}")
 
 
-def _print_drift_diagnostics(side: str, frame_idx: np.ndarray, base_arr: np.ndarray, home: np.ndarray) -> None:
+def _print_drift_diagnostics(
+    side: str,
+    frame_idx: np.ndarray,
+    base_arr: np.ndarray,
+    home: np.ndarray,
+    relative_compress: bool = False,
+    relative_scale: float = 0.02,
+    relative_clip_xyz: Optional[np.ndarray] = None,
+) -> None:
     if base_arr.shape[0] == 0:
         print("drift diagnostics: no data")
         return
 
     anchor = base_arr[0].copy()
     rel = base_arr - anchor[None, :]
+    if relative_compress:
+        if relative_clip_xyz is None:
+            relative_clip_xyz = np.asarray([0.12, 0.12, 0.10], dtype=np.float64)
+        else:
+            relative_clip_xyz = np.asarray(relative_clip_xyz, dtype=np.float64).reshape(3)
+        rel = rel * float(relative_scale)
+        rel = np.clip(rel, -relative_clip_xyz, relative_clip_xyz)
     target = home[None, :] + rel
     step = np.diff(target, axis=0) if target.shape[0] > 1 else np.empty((0, 3), dtype=np.float64)
 
@@ -101,13 +116,16 @@ def _print_drift_diagnostics(side: str, frame_idx: np.ndarray, base_arr: np.ndar
     slope_target = _linear_slope(frame_idx, target)
 
     print("drift diagnostics:")
+    print(f"  relative_compress (scale+clip) = {relative_compress}")
     print(f"  anchor(base first frame) = {_fmt_vec(anchor)}")
     print(f"  home(target center)      = {_fmt_vec(home)}")
     print(f"  slope p_base   (m/frame) = {_fmt_vec(slope_base)}")
     print(f"  slope rel      (m/frame) = {_fmt_vec(slope_rel)}")
     print(f"  slope p_target (m/frame) = {_fmt_vec(slope_target)}")
-    _print_stats("relative displacement rel = p_base - anchor", rel)
-    _print_stats("relative target p_target = home + rel", target)
+    rel_label = "relative displacement rel (after compress if enabled)" if relative_compress else "relative displacement rel = p_base - anchor"
+    tgt_label = "relative target p_target = home + rel" + (" (compressed)" if relative_compress else "")
+    _print_stats(rel_label, rel)
+    _print_stats(tgt_label, target)
     _print_segment_stats("p_target", target)
     if step.shape[0] > 0:
         _print_stats("frame-to-frame step of p_target", step)
@@ -139,6 +157,20 @@ def main() -> None:
         default=[0.25, -0.25, 0.1],
         metavar=("X", "Y", "Z"),
         help="Right home position used to simulate --hamer-relative-pos",
+    )
+    parser.add_argument(
+        "--relative-compress",
+        action="store_true",
+        help="Simulate --hamer-relative-compress (scale + clip) like teleop_hand_and_arm",
+    )
+    parser.add_argument("--relative-scale", type=float, default=0.02, help="With --relative-compress")
+    parser.add_argument(
+        "--relative-clip",
+        type=float,
+        nargs=3,
+        default=[0.12, 0.12, 0.10],
+        metavar=("DX", "DY", "DZ"),
+        help="With --relative-compress",
     )
     args = parser.parse_args()
 
@@ -209,6 +241,9 @@ def main() -> None:
     print("=== Relative mode simulation ===")
     print(f"left_home:  {_fmt_vec(left_home)}")
     print(f"right_home: {_fmt_vec(right_home)}")
+    print(f"relative_compress: {args.relative_compress}")
+    if args.relative_compress:
+        print(f"relative_scale: {args.relative_scale}, relative_clip: {_fmt_vec(np.asarray(args.relative_clip, dtype=np.float64))}")
     print("")
 
     for side in ("left", "right"):
@@ -230,7 +265,15 @@ def main() -> None:
         if frame_arr.size > 0:
             print(f"frame range: [{int(frame_arr[0])}, {int(frame_arr[-1])}] ({frame_arr.size} samples)")
         home = left_home if side == "left" else right_home
-        _print_drift_diagnostics(side, frame_arr.astype(np.float64), base_arr, home)
+        _print_drift_diagnostics(
+            side,
+            frame_arr.astype(np.float64),
+            base_arr,
+            home,
+            relative_compress=args.relative_compress,
+            relative_scale=float(args.relative_scale),
+            relative_clip_xyz=np.asarray(args.relative_clip, dtype=np.float64),
+        )
         print("samples (frame_idx, p_cam -> p_base):")
         if not samples[side]:
             print("  no samples")

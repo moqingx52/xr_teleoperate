@@ -126,12 +126,21 @@ def build_arg_parser():
                         help='Do not drive hand from XR/HaMeR (arm only)')
     parser.add_argument('--hamer-relative-pos', '--hamer_relative_pos', action='store_true', dest='hamer_relative_pos',
                         help='Use first valid HaMeR wrist position as anchor; move around robot home positions')
+    parser.add_argument('--hamer-relative-compress', '--hamer_relative_compress', action='store_true',
+                        dest='hamer_relative_compress',
+                        help='With --hamer-relative-pos: scale + clip relative delta (mitigate depth drift until metric depth is fixed)')
     parser.add_argument('--hamer-left-home', '--hamer_left_home', type=float, nargs=3, default=[0.25, 0.25, 0.1],
                         dest='hamer_left_home', metavar=('X', 'Y', 'Z'),
                         help='Left home position (meters) used by --hamer-relative-pos')
     parser.add_argument('--hamer-right-home', '--hamer_right_home', type=float, nargs=3, default=[0.25, -0.25, 0.1],
                         dest='hamer_right_home', metavar=('X', 'Y', 'Z'),
                         help='Right home position (meters) used by --hamer-relative-pos')
+    parser.add_argument('--hamer-relative-scale', '--hamer_relative_scale', type=float, default=0.02,
+                        dest='hamer_relative_scale',
+                        help='Used only with --hamer-relative-compress: scale relative displacement (default: 0.02)')
+    parser.add_argument('--hamer-relative-clip', '--hamer_relative_clip', type=float, nargs=3, default=[0.12, 0.12, 0.10],
+                        dest='hamer_relative_clip', metavar=('DX', 'DY', 'DZ'),
+                        help='Used only with --hamer-relative-compress: per-axis clip (m) after scaling')
     parser.add_argument('--hamer-frame-offset-json', '--hamer_frame_offset_json', type=str, default=None,
                         dest='hamer_frame_offset_json', help='Optional JSON for frame index offsets')
     parser.add_argument('--hamer-cam2base-json', '--hamer_cam2base_json', type=str, default=None,
@@ -238,6 +247,9 @@ def main(argv=None):
                 relative_position_mode=args.hamer_relative_pos,
                 left_home=np.asarray(args.hamer_left_home, dtype=np.float64),
                 right_home=np.asarray(args.hamer_right_home, dtype=np.float64),
+                relative_compress=args.hamer_relative_compress,
+                relative_scale=float(args.hamer_relative_scale),
+                relative_clip_xyz=np.asarray(args.hamer_relative_clip, dtype=np.float64),
             )
             hamer_hand_bridge = HamerHandBridge()
         

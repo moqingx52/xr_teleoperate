@@ -18,6 +18,9 @@ class HamerAdapter:
         relative_position_mode: bool = False,
         left_home: Optional[np.ndarray] = None,
         right_home: Optional[np.ndarray] = None,
+        relative_compress: bool = False,
+        relative_scale: float = 0.02,
+        relative_clip_xyz: Optional[np.ndarray] = None,
     ):
         self.wrist_calib = wrist_calib
         self.smooth_alpha = float(smooth_alpha)
@@ -27,6 +30,12 @@ class HamerAdapter:
         self.relative_position_mode = bool(relative_position_mode)
         self.left_home = np.asarray(left_home if left_home is not None else [0.25, 0.25, 0.1], dtype=np.float64).reshape(3)
         self.right_home = np.asarray(right_home if right_home is not None else [0.25, -0.25, 0.1], dtype=np.float64).reshape(3)
+        self.relative_compress = bool(relative_compress)
+        self.relative_scale = float(relative_scale)
+        if relative_clip_xyz is None:
+            self.relative_clip_xyz = np.asarray([0.12, 0.12, 0.10], dtype=np.float64)
+        else:
+            self.relative_clip_xyz = np.asarray(relative_clip_xyz, dtype=np.float64).reshape(3)
         self._gap_left = 0
         self._gap_right = 0
         self._have_left = False
@@ -81,11 +90,19 @@ class HamerAdapter:
                     if side_key == "left":
                         if self._anchor_l is None:
                             self._anchor_l = np.asarray(p_ee, dtype=np.float64).reshape(3)
-                        p_ee = self.left_home + (np.asarray(p_ee, dtype=np.float64).reshape(3) - self._anchor_l)
+                        p_rel = np.asarray(p_ee, dtype=np.float64).reshape(3) - self._anchor_l
+                        if self.relative_compress:
+                            p_rel = p_rel * self.relative_scale
+                            p_rel = np.clip(p_rel, -self.relative_clip_xyz, self.relative_clip_xyz)
+                        p_ee = self.left_home + p_rel
                     else:
                         if self._anchor_r is None:
                             self._anchor_r = np.asarray(p_ee, dtype=np.float64).reshape(3)
-                        p_ee = self.right_home + (np.asarray(p_ee, dtype=np.float64).reshape(3) - self._anchor_r)
+                        p_rel = np.asarray(p_ee, dtype=np.float64).reshape(3) - self._anchor_r
+                        if self.relative_compress:
+                            p_rel = p_rel * self.relative_scale
+                            p_rel = np.clip(p_rel, -self.relative_clip_xyz, self.relative_clip_xyz)
+                        p_ee = self.right_home + p_rel
                 prev_p = getattr(self, p_attr).copy()
                 prev_R = getattr(self, R_attr).copy()
                 if getattr(self, have_attr):
