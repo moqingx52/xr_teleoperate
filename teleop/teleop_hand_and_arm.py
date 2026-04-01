@@ -148,6 +148,8 @@ def build_arg_parser():
     parser.add_argument('--hamer-cam2base-json', '--hamer_cam2base_json', type=str, default=None,
                         dest='hamer_cam2base_json',
                         help='When HaMeR JSON has p_wrist/R_wrist only: same 4x4 T_cam2base JSON as HaMeR --cam2base_json')
+    parser.add_argument('--swap-hand-input', '--swap_hand_input', action='store_true', dest='swap_hand_input',
+                        help='Exchange left/right hand skeleton and wrist poses before dex retargeting / arm IK (dataset vs robot LR mismatch)')
     return parser
 
 
@@ -432,10 +434,14 @@ def main(argv=None):
                 and args.input_mode == "hand"
                 and not skip_hand_tele
             ):
+                l_hp = tele_data.left_hand_pos
+                r_hp = tele_data.right_hand_pos
+                if args.swap_hand_input:
+                    l_hp, r_hp = r_hp, l_hp
                 with left_hand_pos_array.get_lock():
-                    left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
+                    left_hand_pos_array[:] = np.asarray(l_hp, dtype=np.float64).reshape(75)
                 with right_hand_pos_array.get_lock():
-                    right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
+                    right_hand_pos_array[:] = np.asarray(r_hp, dtype=np.float64).reshape(75)
             elif (
                 args.input_source == "hamer"
                 and hamer_frame is not None
@@ -444,6 +450,8 @@ def main(argv=None):
                 and not skip_hand_tele
             ):
                 left_hand_pos, right_hand_pos = hamer_hand_bridge.step(hamer_frame)
+                if args.swap_hand_input:
+                    left_hand_pos, right_hand_pos = right_hand_pos, left_hand_pos
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
@@ -482,9 +490,11 @@ def main(argv=None):
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
             if args.input_source == "xr":
-                sol_q, sol_tauff = arm_ik.solve_ik(
-                    tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq
-                )
+                lw = tele_data.left_wrist_pose
+                rw = tele_data.right_wrist_pose
+                if args.swap_hand_input:
+                    lw, rw = rw, lw
+                sol_q, sol_tauff = arm_ik.solve_ik(lw, rw, current_lr_arm_q, current_lr_arm_dq)
             else:
                 targets = hamer_adapter.step(hamer_frame, current_lr_arm_q)
                 lt, rt = targets["left_arm"], targets["right_arm"]
@@ -492,9 +502,10 @@ def main(argv=None):
                     last_hamer_left_tf = homogeneous_from_position_rotation(lt["p_ee_target"], lt["R_ee_target"])
                 if rt["valid"]:
                     last_hamer_right_tf = homogeneous_from_position_rotation(rt["p_ee_target"], rt["R_ee_target"])
-                sol_q, sol_tauff = arm_ik.solve_ik(
-                    last_hamer_left_tf, last_hamer_right_tf, current_lr_arm_q, current_lr_arm_dq
-                )
+                ll_tf, rr_tf = last_hamer_left_tf, last_hamer_right_tf
+                if args.swap_hand_input:
+                    ll_tf, rr_tf = rr_tf, ll_tf
+                sol_q, sol_tauff = arm_ik.solve_ik(ll_tf, rr_tf, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
