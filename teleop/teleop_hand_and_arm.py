@@ -109,8 +109,10 @@ def build_arg_parser():
     parser.add_argument('--task-desc', type=str, default='task description', help='task description for recording at json file')
     parser.add_argument('--task-steps', type=str, default='step1: do this; step2: do that;', help='task steps for recording at json file')
     # HaMeR / offline JSON input (与 hamer/demo.py: --structured_file 默认 hamer_structured_results.json)
-    parser.add_argument('--input-source', '--input_source', type=str, default='xr', choices=['xr', 'hamer'],
-                        dest='input_source', help='xr: TeleVuer; hamer: structured JSON replay')
+    parser.add_argument('--input-source', '--input_source', type=str, default='xr',
+                        choices=['xr', 'hamer', 'egodex'],
+                        dest='input_source',
+                        help='xr: TeleVuer; hamer: structured JSON replay; egodex: HDF5 (EgoDex-style) replay')
     parser.add_argument('--hamer-json', '--hamer_json', type=str, default=None, dest='hamer_json',
                         help='Absolute or relative path to structured JSON (demo: out_folder/hamer_structured_results.json)')
     parser.add_argument('--hamer-out-dir', '--hamer_out_dir', type=str, default=None, dest='hamer_out_dir',
@@ -182,6 +184,19 @@ def build_arg_parser():
     )
     parser.add_argument('--swap-hand-input', '--swap_hand_input', action='store_true', dest='swap_hand_input',
                         help='Exchange left/right hand skeleton and wrist poses before dex retargeting / arm IK (dataset vs robot LR mismatch)')
+    # EgoDex / offline HDF5 input
+    parser.add_argument('--egodex-hdf5', '--egodex_hdf5', type=str, default=None, dest='egodex_hdf5',
+                        help='Absolute or relative path to EgoDex episode HDF5 file')
+    parser.add_argument('--egodex-root-frame', '--egodex_root_frame', type=str,
+                        choices=['world', 'hip', 'camera'], default='hip', dest='egodex_root_frame',
+                        help='Frame used as offline replay root. Recommended: hip')
+    parser.add_argument('--egodex-loop', '--egodex_loop', action='store_true', dest='egodex_loop',
+                        help='Loop EgoDex HDF5 when end is reached')
+    parser.add_argument('--egodex-score-thresh', '--egodex_score_thresh', type=float, default=0.2,
+                        dest='egodex_score_thresh',
+                        help='Minimum confidence to accept leftHand/rightHand in EgoDex')
+    parser.add_argument('--egodex-fps', '--egodex_fps', type=float, default=30.0, dest='egodex_fps',
+                        help='Replay FPS of EgoDex episode (default 30)')
     return parser
 
 
@@ -193,7 +208,7 @@ def _normalize_hamer_relative_args(args: argparse.Namespace) -> None:
     """
     非默认的 scale 或显式 relative/compress/clip 会启用相对手腕模式；自定义 clip 需 compress 才生效。
     """
-    if args.input_source != "hamer":
+    if args.input_source not in ("hamer", "egodex"):
         return
     clip = np.asarray(args.hamer_relative_clip, dtype=np.float64).reshape(3)
     scale = float(args.hamer_relative_scale)
@@ -234,14 +249,23 @@ def main(argv=None):
                 args.hamer_structured_file,
             )
         _normalize_hamer_relative_args(args)
+    elif args.input_source == "egodex":
+        if args.egodex_hdf5:
+            args.egodex_hdf5 = os.path.abspath(os.path.expanduser(args.egodex_hdf5))
+        _normalize_hamer_relative_args(args)
+        if args.replay_fps is None:
+            args.frequency = float(args.egodex_fps)
     logger_mp.info(f"args: {args}")
     if args.input_source == "hamer" and not args.hamer_json:
         logger_mp.error("HaMeR mode requires --hamer-json/--hamer_json or --hamer-out-dir/--hamer_out_dir")
         exit(1)
+    if args.input_source == "egodex" and not args.egodex_hdf5:
+        logger_mp.error("EgoDex mode requires --egodex-hdf5/--egodex_hdf5")
+        exit(1)
     if args.input_source == "hamer" and args.hamer_cam2base_json:
         args.hamer_cam2base_json = os.path.abspath(os.path.expanduser(args.hamer_cam2base_json))
-    if args.input_source == "hamer" and args.motion and args.input_mode == "controller":
-        logger_mp.warning("HaMeR input does not drive locomotion; motion+controller may be inactive.")
+    if args.input_source in ("hamer", "egodex") and args.motion and args.input_mode == "controller":
+        logger_mp.warning("Offline replay input does not drive locomotion; motion+controller may be inactive.")
 
     arm_ctrl = None
     sim_state_subscriber = None
@@ -249,6 +273,7 @@ def main(argv=None):
     reset_pose_shm = None
     ipc_server = None
     listen_keyboard_thread = None
+    hamer_input = None
     try:
         # Real robot: DDS domain 0. Simulation: shm for G1_23/G1_29/H1_2 + dex3/dex1; other combos still need DDS.
         if not args.sim:
@@ -279,11 +304,10 @@ def main(argv=None):
         camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
-        if args.input_source == "hamer":
+        if args.input_source in ("hamer", "egodex"):
             xr_need_local_img = False
 
         tv_wrapper = None
-        hamer_input = None
         hamer_adapter = None
         hamer_hand_bridge = None
         last_hamer_left_tf = np.eye(4, dtype=np.float64)
@@ -300,7 +324,7 @@ def main(argv=None):
                                          webrtc=camera_config['head_camera']['enable_webrtc'],
                                          webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
                                          )
-        else:
+        elif args.input_source == "hamer":
             from teleop.input_source.hamer_input import HamerInputSource
             from teleop.input_source.hamer_adapter import HamerAdapter
             from teleop.input_source.hamer_bridge import HamerHandBridge
@@ -312,6 +336,33 @@ def main(argv=None):
                 loop=args.hamer_loop,
                 frame_offset_json=args.hamer_frame_offset_json,
                 cam2base_json=args.hamer_cam2base_json,
+            )
+            hamer_adapter = HamerAdapter(
+                WristToEEConfig.identity(),
+                smooth_alpha=float(args.hamer_wrist_smooth_alpha),
+                max_step_m=float(args.hamer_wrist_max_step_m),
+                max_step_rad=float(args.hamer_wrist_max_step_rad),
+                relative_position_mode=args.hamer_relative_pos,
+                left_home=np.asarray(args.hamer_left_home, dtype=np.float64),
+                right_home=np.asarray(args.hamer_right_home, dtype=np.float64),
+                mirror_lr_across_xz=args.hamer_mirror_lr_xz,
+                relative_compress=args.hamer_relative_compress,
+                relative_scale=float(args.hamer_relative_scale),
+                relative_clip_xyz=np.asarray(args.hamer_relative_clip, dtype=np.float64),
+            )
+            hamer_hand_bridge = HamerHandBridge(target_bone_len=float(args.hamer_hand_target_bone_len))
+        else:
+            from teleop.input_source.egodex_input import EgoDexInputSource
+            from teleop.input_source.hamer_adapter import HamerAdapter
+            from teleop.input_source.hamer_bridge import HamerHandBridge
+            from teleop.input_source.hamer_to_robot_frame import WristToEEConfig
+
+            hamer_input = EgoDexInputSource(
+                hdf5_path=args.egodex_hdf5,
+                loop=args.egodex_loop,
+                score_thresh=args.egodex_score_thresh,
+                root_frame=args.egodex_root_frame,
+                fps=args.egodex_fps,
             )
             hamer_adapter = HamerAdapter(
                 WristToEEConfig.identity(),
@@ -490,10 +541,11 @@ def main(argv=None):
             if args.input_source == "xr":
                 tele_data = tv_wrapper.get_tele_data()
             hamer_frame = None
-            if args.input_source == "hamer":
+            if args.input_source in ("hamer", "egodex"):
                 hamer_frame = hamer_input.get_frame()
-                if hamer_frame is None and not args.hamer_loop:
-                    logger_mp.info("HaMeR JSON finished (no loop); stopping.")
+                offline_loop = args.hamer_loop if args.input_source == "hamer" else args.egodex_loop
+                if hamer_frame is None and not offline_loop:
+                    logger_mp.info(f"{args.input_source} replay finished (no loop); stopping.")
                     STOP = True
                     break
 
@@ -513,7 +565,7 @@ def main(argv=None):
                 with right_hand_pos_array.get_lock():
                     right_hand_pos_array[:] = np.asarray(r_hp, dtype=np.float64).reshape(75)
             elif (
-                args.input_source == "hamer"
+                args.input_source in ("hamer", "egodex")
                 and hamer_frame is not None
                 and (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco")
                 and args.input_mode == "hand"
@@ -565,7 +617,7 @@ def main(argv=None):
                 if args.swap_hand_input:
                     lw, rw = rw, lw
                 sol_q, sol_tauff = arm_ik.solve_ik(lw, rw, current_lr_arm_q, current_lr_arm_dq)
-            else:
+            elif args.input_source in ("hamer", "egodex"):
                 targets = hamer_adapter.step(hamer_frame, current_lr_arm_q)
                 lt, rt = targets["left_arm"], targets["right_arm"]
                 if lt["valid"]:
@@ -761,6 +813,12 @@ def main(argv=None):
                 tv_wrapper.close()
         except Exception as e:
             logger_mp.error(f"Failed to close televuer wrapper: {e}")
+
+        try:
+            if hamer_input is not None and hasattr(hamer_input, "close"):
+                hamer_input.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close offline input source: {e}")
 
         try:
             if not args.motion:
