@@ -182,6 +182,13 @@ def build_arg_parser():
         dest='hamer_wrist_smooth_alpha',
         help='HamerAdapter: EMA blend toward new wrist target (0..1); lower = smoother, slower to follow (default 0.2)',
     )
+    parser.add_argument(
+        '--hamer-debug-freeze-wrist-rotation',
+        '--hamer_debug_freeze_wrist_rotation',
+        action='store_true',
+        dest='hamer_debug_freeze_wrist_rotation',
+        help='Debug: with --hamer-relative-pos, keep wrist orientation at first-frame anchor (isolates rotation vs position bugs)',
+    )
     parser.add_argument('--swap-hand-input', '--swap_hand_input', action='store_true', dest='swap_hand_input',
                         help='Exchange left/right hand skeleton and wrist poses before dex retargeting / arm IK (dataset vs robot LR mismatch)')
     # EgoDex / offline HDF5 input
@@ -197,6 +204,13 @@ def build_arg_parser():
                         help='Minimum confidence to accept leftHand/rightHand in EgoDex')
     parser.add_argument('--egodex-fps', '--egodex_fps', type=float, default=30.0, dest='egodex_fps',
                         help='Replay FPS of EgoDex episode (default 30)')
+    parser.add_argument(
+        '--egodex-arkit-wrist-rotation',
+        '--egodex_arkit_wrist_rotation',
+        action='store_true',
+        dest='egodex_arkit_wrist_rotation',
+        help='Use transforms/*Hand 3x3 rotation as R_wrist_base (old behavior); default rebuilds wrist frame from knuckles+forearm for IK',
+    )
     return parser
 
 
@@ -349,6 +363,7 @@ def main(argv=None):
                 relative_compress=args.hamer_relative_compress,
                 relative_scale=float(args.hamer_relative_scale),
                 relative_clip_xyz=np.asarray(args.hamer_relative_clip, dtype=np.float64),
+                debug_freeze_wrist_rotation=args.hamer_debug_freeze_wrist_rotation,
             )
             hamer_hand_bridge = HamerHandBridge(target_bone_len=float(args.hamer_hand_target_bone_len))
         else:
@@ -363,6 +378,7 @@ def main(argv=None):
                 score_thresh=args.egodex_score_thresh,
                 root_frame=args.egodex_root_frame,
                 fps=args.egodex_fps,
+                repo_wrist_basis=not args.egodex_arkit_wrist_rotation,
             )
             hamer_adapter = HamerAdapter(
                 WristToEEConfig.identity(),
@@ -376,6 +392,7 @@ def main(argv=None):
                 relative_compress=args.hamer_relative_compress,
                 relative_scale=float(args.hamer_relative_scale),
                 relative_clip_xyz=np.asarray(args.hamer_relative_clip, dtype=np.float64),
+                debug_freeze_wrist_rotation=args.hamer_debug_freeze_wrist_rotation,
             )
             hamer_hand_bridge = HamerHandBridge(target_bone_len=float(args.hamer_hand_target_bone_len))
         

@@ -61,6 +61,28 @@ def _make_valid_side_false() -> Dict[str, Any]:
     }
 
 
+def _normalize_vec(v: np.ndarray, eps: float = 1e-8) -> Optional[np.ndarray]:
+    v = np.asarray(v, dtype=np.float64).reshape(-1)
+    n = float(np.linalg.norm(v))
+    if n < eps:
+        return None
+    return (v / n).astype(np.float64)
+
+
+def _orthonormalize_cols(x: np.ndarray, _y_unused: np.ndarray, z: np.ndarray) -> Optional[np.ndarray]:
+    x = _normalize_vec(x)
+    z = _normalize_vec(z)
+    if x is None or z is None:
+        return None
+    y = _normalize_vec(np.cross(z, x))
+    if y is None:
+        return None
+    z2 = _normalize_vec(np.cross(x, y))
+    if z2 is None:
+        return None
+    return np.stack([x, y, z2], axis=1)
+
+
 class EgoDexInputSource:
     """
     Minimal reader for EgoDex HDF5.
@@ -132,12 +154,14 @@ class EgoDexInputSource:
         score_thresh: float = 0.2,
         root_frame: str = "hip",   # one of: world, hip, camera
         fps: float = 30.0,
+        repo_wrist_basis: bool = True,
     ):
         self.hdf5_path = os.path.abspath(os.path.expanduser(hdf5_path))
         self.loop = bool(loop)
         self.score_thresh = float(score_thresh)
         self.root_frame = str(root_frame).strip().lower()
         self.fps = float(fps)
+        self.repo_wrist_basis = bool(repo_wrist_basis)
         self._index = 0
 
         if self.root_frame not in ("world", "hip", "camera"):
@@ -169,7 +193,8 @@ class EgoDexInputSource:
 
         logger_mp.info(
             f"[EgoDexInputSource] loaded {self._num_frames} frames from {self.hdf5_path}, "
-            f"root_frame={self.root_frame}, fps={self.fps}, score_thresh={self.score_thresh}"
+            f"root_frame={self.root_frame}, fps={self.fps}, score_thresh={self.score_thresh}, "
+            f"repo_wrist_basis={self.repo_wrist_basis}"
         )
 
     def __del__(self):
@@ -232,6 +257,72 @@ class EgoDexInputSource:
         pts_local = pts - wrist
         return pts_local
 
+    def _build_repo_wrist_basis(
+        self,
+        side: str,
+        frame_idx: int,
+        T_root_inv: np.ndarray,
+        R_raw: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """
+        Rebuild wrist rotation to match xr_teleoperate wrist convention (see issue #25):
+        x: wrist -> fingers (via index/little knuckle mid), y: index<->pinky chirality,
+        z: palm normal (x cross y). ARKit leftHand 4x4 rotation alone is often wrong for IK.
+        """
+        prefix = "left" if side == "left" else "right"
+        wrist_n = f"{prefix}Hand"
+        forearm_n = f"{prefix}Forearm"
+        index_k_n = f"{prefix}IndexFingerKnuckle"
+        little_k_n = f"{prefix}LittleFingerKnuckle"
+
+        def _fallback_r() -> np.ndarray:
+            if R_raw is not None:
+                return np.asarray(R_raw, dtype=np.float64).reshape(3, 3).copy()
+            return np.eye(3, dtype=np.float64)
+
+        for name in (wrist_n, index_k_n, little_k_n):
+            if name not in self._tf_group:
+                return _fallback_r()
+
+        wrist = self._get_rel_tf(wrist_n, frame_idx, T_root_inv)[:3, 3]
+        index_k = self._get_rel_tf(index_k_n, frame_idx, T_root_inv)[:3, 3]
+        little_k = self._get_rel_tf(little_k_n, frame_idx, T_root_inv)[:3, 3]
+
+        middle_like = 0.5 * (index_k + little_k)
+        x = _normalize_vec(middle_like - wrist)
+        if x is None:
+            return _fallback_r()
+
+        if side == "left":
+            y_hint = _normalize_vec(little_k - index_k)
+        else:
+            y_hint = _normalize_vec(index_k - little_k)
+        if y_hint is None:
+            return _fallback_r()
+
+        z = _normalize_vec(np.cross(x, y_hint))
+        if z is None:
+            return _fallback_r()
+
+        R = _orthonormalize_cols(x, y_hint, z)
+        if R is None:
+            return _fallback_r()
+
+        if R_raw is not None:
+            R_raw33 = np.asarray(R_raw, dtype=np.float64).reshape(3, 3)
+            if float(np.dot(R[:, 2], R_raw33[:, 2])) < 0.0:
+                R[:, 1] *= -1.0
+                R[:, 2] *= -1.0
+
+        if forearm_n in self._tf_group:
+            forearm = self._get_rel_tf(forearm_n, frame_idx, T_root_inv)[:3, 3]
+            forearm_dir = _normalize_vec(wrist - forearm)
+            if forearm_dir is not None and float(np.dot(R[:, 0], forearm_dir)) < 0.0:
+                R[:, 0] *= -1.0
+                R[:, 1] *= -1.0
+
+        return R
+
     def _make_side(
         self,
         side: str,
@@ -246,7 +337,11 @@ class EgoDexInputSource:
 
         T_rel = self._get_rel_tf(wrist_name, frame_idx, T_root_inv)
         p = T_rel[:3, 3].astype(np.float64).copy()
-        R = T_rel[:3, :3].astype(np.float64).copy()
+        R_raw = T_rel[:3, :3].astype(np.float64).copy()
+        if self.repo_wrist_basis:
+            R = self._build_repo_wrist_basis(side, frame_idx, T_root_inv, R_raw=R_raw)
+        else:
+            R = R_raw.copy()
 
         if not np.all(np.isfinite(p)) or not np.all(np.isfinite(R)):
             return _make_valid_side_false()

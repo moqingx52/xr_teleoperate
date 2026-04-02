@@ -22,6 +22,7 @@ class HamerAdapter:
         relative_compress: bool = False,
         relative_scale: float = 0.02,
         relative_clip_xyz: Optional[np.ndarray] = None,
+        debug_freeze_wrist_rotation: bool = False,
     ):
         # relative 模式：位置为 home + scale*(p_ee - p_anchor)；旋转为相对首帧锚点角增量乘同一 scale。
         # relative_compress：仅对缩放后的位置增量做 per-axis clip。
@@ -40,6 +41,7 @@ class HamerAdapter:
             self.relative_clip_xyz = np.asarray([0.12, 0.12, 0.10], dtype=np.float64)
         else:
             self.relative_clip_xyz = np.asarray(relative_clip_xyz, dtype=np.float64).reshape(3)
+        self.debug_freeze_wrist_rotation = bool(debug_freeze_wrist_rotation)
         self._gap_left = 0
         self._gap_right = 0
         self._have_left = False
@@ -118,7 +120,10 @@ class HamerAdapter:
                         if self.relative_compress:
                             p_rel = np.clip(p_rel, -self.relative_clip_xyz, self.relative_clip_xyz)
                         p_ee = self.left_home + p_rel
-                        R_ee = hf.scale_rotation_about_anchor(self._anchor_R_l, R_ee, self.relative_scale)
+                        if self.debug_freeze_wrist_rotation:
+                            R_ee = self._anchor_R_l.copy()
+                        else:
+                            R_ee = hf.scale_rotation_about_anchor(self._anchor_R_l, R_ee, self.relative_scale)
                     else:
                         if self._anchor_r is None:
                             self._anchor_r = np.asarray(p_ee, dtype=np.float64).reshape(3).copy()
@@ -128,7 +133,10 @@ class HamerAdapter:
                         if self.relative_compress:
                             p_rel = np.clip(p_rel, -self.relative_clip_xyz, self.relative_clip_xyz)
                         p_ee = self.right_home + p_rel
-                        R_ee = hf.scale_rotation_about_anchor(self._anchor_R_r, R_ee, self.relative_scale)
+                        if self.debug_freeze_wrist_rotation:
+                            R_ee = self._anchor_R_r.copy()
+                        else:
+                            R_ee = hf.scale_rotation_about_anchor(self._anchor_R_r, R_ee, self.relative_scale)
                 prev_p = getattr(self, p_attr).copy()
                 prev_R = getattr(self, R_attr).copy()
                 if getattr(self, have_attr):
