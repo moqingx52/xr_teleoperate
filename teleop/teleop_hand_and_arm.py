@@ -148,6 +148,14 @@ def build_arg_parser():
     parser.add_argument('--hamer-cam2base-json', '--hamer_cam2base_json', type=str, default=None,
                         dest='hamer_cam2base_json',
                         help='When HaMeR JSON has p_wrist/R_wrist only: same 4x4 T_cam2base JSON as HaMeR --cam2base_json')
+    parser.add_argument(
+        '--hamer-hand-target-bone-len',
+        '--hamer_hand_target_bone_len',
+        type=float,
+        default=0.10,
+        dest='hamer_hand_target_bone_len',
+        help='HamerHandBridge: target middle-finger MCP bone length (m) for scaling keypoints_3d_local to 25pt layout (default 0.10)',
+    )
     parser.add_argument('--swap-hand-input', '--swap_hand_input', action='store_true', dest='swap_hand_input',
                         help='Exchange left/right hand skeleton and wrist poses before dex retargeting / arm IK (dataset vs robot LR mismatch)')
     return parser
@@ -256,7 +264,7 @@ def main(argv=None):
                 relative_scale=float(args.hamer_relative_scale),
                 relative_clip_xyz=np.asarray(args.hamer_relative_clip, dtype=np.float64),
             )
-            hamer_hand_bridge = HamerHandBridge()
+            hamer_hand_bridge = HamerHandBridge(target_bone_len=float(args.hamer_hand_target_bone_len))
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.motion:
