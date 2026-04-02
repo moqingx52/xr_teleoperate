@@ -100,13 +100,12 @@ def _print_drift_diagnostics(
         return
 
     anchor = base_arr[0].copy()
-    rel = base_arr - anchor[None, :]
+    rel = (base_arr - anchor[None, :]) * float(relative_scale)
     if relative_compress:
         if relative_clip_xyz is None:
             relative_clip_xyz = np.asarray([0.12, 0.12, 0.10], dtype=np.float64)
         else:
             relative_clip_xyz = np.asarray(relative_clip_xyz, dtype=np.float64).reshape(3)
-        rel = rel * float(relative_scale)
         rel = np.clip(rel, -relative_clip_xyz, relative_clip_xyz)
     target = home[None, :] + rel
     step = np.diff(target, axis=0) if target.shape[0] > 1 else np.empty((0, 3), dtype=np.float64)
@@ -116,14 +115,14 @@ def _print_drift_diagnostics(
     slope_target = _linear_slope(frame_idx, target)
 
     print("drift diagnostics:")
-    print(f"  relative_compress (scale+clip) = {relative_compress}")
+    print(f"  relative_compress (clip scaled delta) = {relative_compress}")
     print(f"  anchor(base first frame) = {_fmt_vec(anchor)}")
     print(f"  home(target center)      = {_fmt_vec(home)}")
     print(f"  slope p_base   (m/frame) = {_fmt_vec(slope_base)}")
     print(f"  slope rel      (m/frame) = {_fmt_vec(slope_rel)}")
     print(f"  slope p_target (m/frame) = {_fmt_vec(slope_target)}")
-    rel_label = "relative displacement rel (after compress if enabled)" if relative_compress else "relative displacement rel = p_base - anchor"
-    tgt_label = "relative target p_target = home + rel" + (" (compressed)" if relative_compress else "")
+    rel_label = "scaled rel = scale * (p_base - anchor)" + (" then clipped" if relative_compress else "")
+    tgt_label = "p_target = home + rel"
     _print_stats(rel_label, rel)
     _print_stats(tgt_label, target)
     _print_segment_stats("p_target", target)
@@ -161,9 +160,9 @@ def main() -> None:
     parser.add_argument(
         "--relative-compress",
         action="store_true",
-        help="Simulate --hamer-relative-compress (scale + clip) like teleop_hand_and_arm",
+        help="Simulate --hamer-relative-compress (clip scaled position delta) like teleop_hand_and_arm",
     )
-    parser.add_argument("--relative-scale", type=float, default=0.02, help="With --relative-compress")
+    parser.add_argument("--relative-scale", type=float, default=0.02, help="Scale (p_base - anchor) before optional clip")
     parser.add_argument(
         "--relative-clip",
         type=float,
@@ -242,8 +241,9 @@ def main() -> None:
     print(f"left_home:  {_fmt_vec(left_home)}")
     print(f"right_home: {_fmt_vec(right_home)}")
     print(f"relative_compress: {args.relative_compress}")
+    print(f"relative_scale: {args.relative_scale}, relative_compress: {args.relative_compress}")
     if args.relative_compress:
-        print(f"relative_scale: {args.relative_scale}, relative_clip: {_fmt_vec(np.asarray(args.relative_clip, dtype=np.float64))}")
+        print(f"relative_clip: {_fmt_vec(np.asarray(args.relative_clip, dtype=np.float64))}")
     print("")
 
     for side in ("left", "right"):

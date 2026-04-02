@@ -23,6 +23,8 @@ class HamerAdapter:
         relative_scale: float = 0.02,
         relative_clip_xyz: Optional[np.ndarray] = None,
     ):
+        # relative 模式：位置为 home + scale*(p_ee - p_anchor)；旋转为相对首帧锚点角增量乘同一 scale。
+        # relative_compress：仅对缩放后的位置增量做 per-axis clip。
         self.wrist_calib = wrist_calib
         self.smooth_alpha = float(smooth_alpha)
         self.max_gap_frames = int(max_gap_frames)
@@ -48,6 +50,8 @@ class HamerAdapter:
         self._R_r = np.eye(3)
         self._anchor_l = None
         self._anchor_r = None
+        self._anchor_R_l = None
+        self._anchor_R_r = None
         self._M_xz = np.diag(np.array([1.0, -1.0, 1.0], dtype=np.float64))
 
     def _side_valid(self, side_data: Dict[str, Any]) -> bool:
@@ -107,20 +111,24 @@ class HamerAdapter:
                 if self.relative_position_mode:
                     if side_key == "left":
                         if self._anchor_l is None:
-                            self._anchor_l = np.asarray(p_ee, dtype=np.float64).reshape(3)
+                            self._anchor_l = np.asarray(p_ee, dtype=np.float64).reshape(3).copy()
+                            self._anchor_R_l = np.asarray(R_ee, dtype=np.float64).reshape(3, 3).copy()
                         p_rel = np.asarray(p_ee, dtype=np.float64).reshape(3) - self._anchor_l
+                        p_rel = p_rel * self.relative_scale
                         if self.relative_compress:
-                            p_rel = p_rel * self.relative_scale
                             p_rel = np.clip(p_rel, -self.relative_clip_xyz, self.relative_clip_xyz)
                         p_ee = self.left_home + p_rel
+                        R_ee = hf.scale_rotation_about_anchor(self._anchor_R_l, R_ee, self.relative_scale)
                     else:
                         if self._anchor_r is None:
-                            self._anchor_r = np.asarray(p_ee, dtype=np.float64).reshape(3)
+                            self._anchor_r = np.asarray(p_ee, dtype=np.float64).reshape(3).copy()
+                            self._anchor_R_r = np.asarray(R_ee, dtype=np.float64).reshape(3, 3).copy()
                         p_rel = np.asarray(p_ee, dtype=np.float64).reshape(3) - self._anchor_r
+                        p_rel = p_rel * self.relative_scale
                         if self.relative_compress:
-                            p_rel = p_rel * self.relative_scale
                             p_rel = np.clip(p_rel, -self.relative_clip_xyz, self.relative_clip_xyz)
                         p_ee = self.right_home + p_rel
+                        R_ee = hf.scale_rotation_about_anchor(self._anchor_R_r, R_ee, self.relative_scale)
                 prev_p = getattr(self, p_attr).copy()
                 prev_R = getattr(self, R_attr).copy()
                 if getattr(self, have_attr):

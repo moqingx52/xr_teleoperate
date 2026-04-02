@@ -125,12 +125,12 @@ def build_arg_parser():
     parser.add_argument('--hamer-arm-only', '--hamer_arm_only', action='store_true', dest='hamer_arm_only',
                         help='Do not drive hand from XR/HaMeR (arm only)')
     parser.add_argument('--hamer-relative-pos', '--hamer_relative_pos', action='store_true', dest='hamer_relative_pos',
-                        help='Use first valid HaMeR wrist position as anchor; move around robot home positions')
+                        help='Wrist EE pose: anchor at first valid frame; position home+scale*Δp, rotation relative anchor with same scale')
     parser.add_argument('--hamer-mirror-lr-xz', '--hamer_mirror_lr_xz', action='store_true', dest='hamer_mirror_lr_xz',
                         help='Swap left/right HaMeR wrists and mirror across robot xz-plane (y->-y)')
     parser.add_argument('--hamer-relative-compress', '--hamer_relative_compress', action='store_true',
                         dest='hamer_relative_compress',
-                        help='With --hamer-relative-pos: scale relative delta (--hamer-relative-scale) then clip; auto-on if scale/clip differ from defaults')
+                        help='With --hamer-relative-pos: after scaling position delta, clip each axis to ±--hamer-relative-clip (rotation not clipped)')
     parser.add_argument('--hamer-left-home', '--hamer_left_home', type=float, nargs=3, default=[0.25, 0.25, 0.1],
                         dest='hamer_left_home', metavar=('X', 'Y', 'Z'),
                         help='Left home position (meters) used by --hamer-relative-pos')
@@ -139,10 +139,10 @@ def build_arg_parser():
                         help='Right home position (meters) used by --hamer-relative-pos')
     parser.add_argument('--hamer-relative-scale', '--hamer_relative_scale', type=float, default=0.02,
                         dest='hamer_relative_scale',
-                        help='Scale relative wrist delta (after anchor); needs --hamer-relative-pos + --hamer-relative-compress (auto-enabled if non-default)')
+                        help='With --hamer-relative-pos: scales position Δ and relative rotation angle from anchor (default 0.02)')
     parser.add_argument('--hamer-relative-clip', '--hamer_relative_clip', type=float, nargs=3, default=[0.12, 0.12, 0.10],
                         dest='hamer_relative_clip', metavar=('DX', 'DY', 'DZ'),
-                        help='Axis clip (m) on scaled relative delta; same prerequisites as --hamer-relative-scale (auto-enabled if non-default)')
+                        help='With --hamer-relative-compress: per-axis clip (m) on scaled position delta only')
     parser.add_argument('--hamer-frame-offset-json', '--hamer_frame_offset_json', type=str, default=None,
                         dest='hamer_frame_offset_json', help='Optional JSON for frame index offsets')
     parser.add_argument('--hamer-cam2base-json', '--hamer_cam2base_json', type=str, default=None,
@@ -191,8 +191,7 @@ _DEFAULT_HAMER_REL_CLIP = np.array([0.12, 0.12, 0.10], dtype=np.float64)
 
 def _normalize_hamer_relative_args(args: argparse.Namespace) -> None:
     """
-    HamerAdapter 只在 relative_position_mode 且 (relative_compress 或非默认 scale/clip 意图) 下才用 scale/clip；
-    此前若只传 --hamer-relative-scale/--hamer-relative-clip 会被静默忽略。
+    非默认的 scale 或显式 relative/compress/clip 会启用相对手腕模式；自定义 clip 需 compress 才生效。
     """
     if args.input_source != "hamer":
         return
@@ -200,19 +199,22 @@ def _normalize_hamer_relative_args(args: argparse.Namespace) -> None:
     scale = float(args.hamer_relative_scale)
     scale_changed = abs(scale - _DEFAULT_HAMER_REL_SCALE) > 1e-12
     clip_changed = bool(np.any(np.abs(clip - _DEFAULT_HAMER_REL_CLIP) > 1e-12))
-    wants_compress_pipeline = bool(args.hamer_relative_compress) or scale_changed or clip_changed
-    if not wants_compress_pipeline:
+    wants_relative = (
+        bool(args.hamer_relative_pos)
+        or bool(args.hamer_relative_compress)
+        or scale_changed
+        or clip_changed
+    )
+    if not wants_relative:
         return
     if not args.hamer_relative_pos:
         logger_mp.warning(
-            "[HaMeR] --hamer-relative-scale / --hamer-relative-clip / --hamer-relative-compress require "
-            "--hamer-relative-pos (anchor + offset around home). Enabling --hamer-relative-pos so they take effect."
+            "[HaMeR] relative wrist options need --hamer-relative-pos (anchor at first valid pose). Enabling it."
         )
         args.hamer_relative_pos = True
-    if not args.hamer_relative_compress and (scale_changed or clip_changed):
+    if clip_changed and not args.hamer_relative_compress:
         logger_mp.warning(
-            "[HaMeR] --hamer-relative-scale/--hamer-relative-clip differ from defaults but compress was off; "
-            "enabling --hamer-relative-compress."
+            "[HaMeR] non-default --hamer-relative-clip only applies with --hamer-relative-compress; enabling compress."
         )
         args.hamer_relative_compress = True
 

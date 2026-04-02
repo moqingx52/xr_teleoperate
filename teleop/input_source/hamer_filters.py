@@ -23,6 +23,18 @@ def clamp_translation_step(prev: np.ndarray, cur: np.ndarray, max_step_m: float)
     return prev + delta * (max_step_m / n)
 
 
+def scale_rotation_about_anchor(R_anchor: np.ndarray, R_curr: np.ndarray, scale: float) -> np.ndarray:
+    """将 R_curr 相对 R_anchor 的旋转角按 scale 缩放：R_out = R_anchor @ exp(scale * log(R_anchor^T R_curr))。"""
+    R_anchor = np.asarray(R_anchor, dtype=np.float64).reshape(3, 3)
+    R_curr = np.asarray(R_curr, dtype=np.float64).reshape(3, 3)
+    s = float(scale)
+    if abs(s) < 1e-15:
+        return R_anchor.copy()
+    R_rel = R_anchor.T @ R_curr
+    rotvec = pin.log3(R_rel)
+    return R_anchor @ pin.exp3(rotvec * s)
+
+
 def clamp_rotation_step(prev_R: np.ndarray, cur_R: np.ndarray, max_step_rad: float) -> np.ndarray:
     """对相对旋转进行角度限幅：R_rel = prev_R^T @ cur_R，按轴角缩放。"""
     prev_R = np.asarray(prev_R, dtype=np.float64).reshape(3, 3)
