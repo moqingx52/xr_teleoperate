@@ -28,11 +28,20 @@ Important:
 import os
 from typing import Any, Dict, Optional
 
-import h5py
 import numpy as np
 import logging_mp
 
 logger_mp = logging_mp.getLogger(__name__)
+
+
+def _import_h5py():
+    try:
+        import h5py
+        return h5py
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "EgoDex HDF5 回放需要安装 h5py，请在当前环境执行: pip install h5py"
+        ) from e
 
 
 def _ensure_tf44(x: np.ndarray) -> np.ndarray:
@@ -137,6 +146,7 @@ class EgoDexInputSource:
         if not os.path.isfile(self.hdf5_path):
             raise FileNotFoundError(f"EgoDex HDF5 not found: {self.hdf5_path}")
 
+        h5py = _import_h5py()
         self._f = h5py.File(self.hdf5_path, "r")
 
         if "transforms" not in self._f:
