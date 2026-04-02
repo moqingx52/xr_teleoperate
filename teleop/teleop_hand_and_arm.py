@@ -85,6 +85,32 @@ def get_state() -> dict:
         "RECORD_RUNNING": RECORD_RUNNING,
     }
 
+
+def _rot_x(rad: float) -> np.ndarray:
+    c, s = np.cos(rad), np.sin(rad)
+    return np.array([[1.0, 0.0, 0.0],
+                     [0.0, c, -s],
+                     [0.0, s, c]], dtype=np.float64)
+
+
+def _rot_y(rad: float) -> np.ndarray:
+    c, s = np.cos(rad), np.sin(rad)
+    return np.array([[c, 0.0, s],
+                     [0.0, 1.0, 0.0],
+                     [-s, 0.0, c]], dtype=np.float64)
+
+
+def _rot_z(rad: float) -> np.ndarray:
+    c, s = np.cos(rad), np.sin(rad)
+    return np.array([[c, -s, 0.0],
+                     [s, c, 0.0],
+                     [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def _rpy_deg_to_R_xyz(rpy_deg) -> np.ndarray:
+    r, p, y = np.deg2rad(np.asarray(rpy_deg, dtype=np.float64).reshape(3))
+    return _rot_x(r) @ _rot_y(p) @ _rot_z(y)
+
 def build_arg_parser():
     parser = argparse.ArgumentParser()
     # basic control parameters
@@ -210,6 +236,26 @@ def build_arg_parser():
         action='store_true',
         dest='egodex_arkit_wrist_rotation',
         help='Use transforms/*Hand 3x3 rotation as R_wrist_base (old behavior); default rebuilds wrist frame from knuckles+forearm for IK',
+    )
+    parser.add_argument(
+        '--wrist-left-rpy-deg',
+        '--wrist_left_rpy_deg',
+        type=float,
+        nargs=3,
+        default=[0.0, 0.0, 0.0],
+        dest='wrist_left_rpy_deg',
+        metavar=('ROLL_X_DEG', 'PITCH_Y_DEG', 'YAW_Z_DEG'),
+        help='WristToEE left constant rotation offset in degrees (XYZ order, applied as R_x@R_y@R_z)',
+    )
+    parser.add_argument(
+        '--wrist-right-rpy-deg',
+        '--wrist_right_rpy_deg',
+        type=float,
+        nargs=3,
+        default=[0.0, 0.0, 0.0],
+        dest='wrist_right_rpy_deg',
+        metavar=('ROLL_X_DEG', 'PITCH_Y_DEG', 'YAW_Z_DEG'),
+        help='WristToEE right constant rotation offset in degrees (XYZ order, applied as R_x@R_y@R_z)',
     )
     return parser
 
@@ -344,6 +390,12 @@ def main(argv=None):
             from teleop.input_source.hamer_bridge import HamerHandBridge
             from teleop.input_source.hamer_to_robot_frame import WristToEEConfig
 
+            wrist_cfg = WristToEEConfig(
+                t_left=np.zeros(3, dtype=np.float64),
+                R_left=_rpy_deg_to_R_xyz(args.wrist_left_rpy_deg),
+                t_right=np.zeros(3, dtype=np.float64),
+                R_right=_rpy_deg_to_R_xyz(args.wrist_right_rpy_deg),
+            )
             hamer_input = HamerInputSource(
                 json_path=args.hamer_json,
                 score_thresh=args.hamer_score_thresh,
@@ -352,7 +404,7 @@ def main(argv=None):
                 cam2base_json=args.hamer_cam2base_json,
             )
             hamer_adapter = HamerAdapter(
-                WristToEEConfig.identity(),
+                wrist_cfg,
                 smooth_alpha=float(args.hamer_wrist_smooth_alpha),
                 max_step_m=float(args.hamer_wrist_max_step_m),
                 max_step_rad=float(args.hamer_wrist_max_step_rad),
@@ -372,6 +424,12 @@ def main(argv=None):
             from teleop.input_source.hamer_bridge import HamerHandBridge
             from teleop.input_source.hamer_to_robot_frame import WristToEEConfig
 
+            wrist_cfg = WristToEEConfig(
+                t_left=np.zeros(3, dtype=np.float64),
+                R_left=_rpy_deg_to_R_xyz(args.wrist_left_rpy_deg),
+                t_right=np.zeros(3, dtype=np.float64),
+                R_right=_rpy_deg_to_R_xyz(args.wrist_right_rpy_deg),
+            )
             hamer_input = EgoDexInputSource(
                 hdf5_path=args.egodex_hdf5,
                 loop=args.egodex_loop,
@@ -381,7 +439,7 @@ def main(argv=None):
                 repo_wrist_basis=not args.egodex_arkit_wrist_rotation,
             )
             hamer_adapter = HamerAdapter(
-                WristToEEConfig.identity(),
+                wrist_cfg,
                 smooth_alpha=float(args.hamer_wrist_smooth_alpha),
                 max_step_m=float(args.hamer_wrist_max_step_m),
                 max_step_rad=float(args.hamer_wrist_max_step_rad),
