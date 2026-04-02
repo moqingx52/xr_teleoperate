@@ -130,7 +130,7 @@ def build_arg_parser():
                         help='Swap left/right HaMeR wrists and mirror across robot xz-plane (y->-y)')
     parser.add_argument('--hamer-relative-compress', '--hamer_relative_compress', action='store_true',
                         dest='hamer_relative_compress',
-                        help='With --hamer-relative-pos: scale + clip relative delta (mitigate depth drift until metric depth is fixed)')
+                        help='With --hamer-relative-pos: scale relative delta (--hamer-relative-scale) then clip; auto-on if scale/clip differ from defaults')
     parser.add_argument('--hamer-left-home', '--hamer_left_home', type=float, nargs=3, default=[0.25, 0.25, 0.1],
                         dest='hamer_left_home', metavar=('X', 'Y', 'Z'),
                         help='Left home position (meters) used by --hamer-relative-pos')
@@ -139,10 +139,10 @@ def build_arg_parser():
                         help='Right home position (meters) used by --hamer-relative-pos')
     parser.add_argument('--hamer-relative-scale', '--hamer_relative_scale', type=float, default=0.02,
                         dest='hamer_relative_scale',
-                        help='Used only with --hamer-relative-compress: scale relative displacement (default: 0.02)')
+                        help='Scale relative wrist delta (after anchor); needs --hamer-relative-pos + --hamer-relative-compress (auto-enabled if non-default)')
     parser.add_argument('--hamer-relative-clip', '--hamer_relative_clip', type=float, nargs=3, default=[0.12, 0.12, 0.10],
                         dest='hamer_relative_clip', metavar=('DX', 'DY', 'DZ'),
-                        help='Used only with --hamer-relative-compress: per-axis clip (m) after scaling')
+                        help='Axis clip (m) on scaled relative delta; same prerequisites as --hamer-relative-scale (auto-enabled if non-default)')
     parser.add_argument('--hamer-frame-offset-json', '--hamer_frame_offset_json', type=str, default=None,
                         dest='hamer_frame_offset_json', help='Optional JSON for frame index offsets')
     parser.add_argument('--hamer-cam2base-json', '--hamer_cam2base_json', type=str, default=None,
@@ -156,9 +156,65 @@ def build_arg_parser():
         dest='hamer_hand_target_bone_len',
         help='HamerHandBridge: target middle-finger MCP bone length (m) for scaling keypoints_3d_local to 25pt layout (default 0.10)',
     )
+    parser.add_argument(
+        '--hamer-wrist-max-step-m',
+        '--hamer_wrist_max_step_m',
+        type=float,
+        default=0.03,
+        dest='hamer_wrist_max_step_m',
+        help='HamerAdapter: max wrist/EE translation per control tick (m); smaller = smaller motion range per frame (default 0.03)',
+    )
+    parser.add_argument(
+        '--hamer-wrist-max-step-rad',
+        '--hamer_wrist_max_step_rad',
+        type=float,
+        default=0.2,
+        dest='hamer_wrist_max_step_rad',
+        help='HamerAdapter: max wrist/EE rotation per tick (rad); smaller = slower orientation changes (default 0.2)',
+    )
+    parser.add_argument(
+        '--hamer-wrist-smooth-alpha',
+        '--hamer_wrist_smooth_alpha',
+        type=float,
+        default=0.2,
+        dest='hamer_wrist_smooth_alpha',
+        help='HamerAdapter: EMA blend toward new wrist target (0..1); lower = smoother, slower to follow (default 0.2)',
+    )
     parser.add_argument('--swap-hand-input', '--swap_hand_input', action='store_true', dest='swap_hand_input',
                         help='Exchange left/right hand skeleton and wrist poses before dex retargeting / arm IK (dataset vs robot LR mismatch)')
     return parser
+
+
+_DEFAULT_HAMER_REL_SCALE = 0.02
+_DEFAULT_HAMER_REL_CLIP = np.array([0.12, 0.12, 0.10], dtype=np.float64)
+
+
+def _normalize_hamer_relative_args(args: argparse.Namespace) -> None:
+    """
+    HamerAdapter 只在 relative_position_mode 且 (relative_compress 或非默认 scale/clip 意图) 下才用 scale/clip；
+    此前若只传 --hamer-relative-scale/--hamer-relative-clip 会被静默忽略。
+    """
+    if args.input_source != "hamer":
+        return
+    clip = np.asarray(args.hamer_relative_clip, dtype=np.float64).reshape(3)
+    scale = float(args.hamer_relative_scale)
+    scale_changed = abs(scale - _DEFAULT_HAMER_REL_SCALE) > 1e-12
+    clip_changed = bool(np.any(np.abs(clip - _DEFAULT_HAMER_REL_CLIP) > 1e-12))
+    wants_compress_pipeline = bool(args.hamer_relative_compress) or scale_changed or clip_changed
+    if not wants_compress_pipeline:
+        return
+    if not args.hamer_relative_pos:
+        logger_mp.warning(
+            "[HaMeR] --hamer-relative-scale / --hamer-relative-clip / --hamer-relative-compress require "
+            "--hamer-relative-pos (anchor + offset around home). Enabling --hamer-relative-pos so they take effect."
+        )
+        args.hamer_relative_pos = True
+    if not args.hamer_relative_compress and (scale_changed or clip_changed):
+        logger_mp.warning(
+            "[HaMeR] --hamer-relative-scale/--hamer-relative-clip differ from defaults but compress was off; "
+            "enabling --hamer-relative-compress."
+        )
+        args.hamer_relative_compress = True
 
 
 def main(argv=None):
@@ -175,6 +231,7 @@ def main(argv=None):
                 os.path.abspath(os.path.expanduser(args.hamer_out_dir)),
                 args.hamer_structured_file,
             )
+        _normalize_hamer_relative_args(args)
     logger_mp.info(f"args: {args}")
     if args.input_source == "hamer" and not args.hamer_json:
         logger_mp.error("HaMeR mode requires --hamer-json/--hamer_json or --hamer-out-dir/--hamer_out_dir")
@@ -256,6 +313,9 @@ def main(argv=None):
             )
             hamer_adapter = HamerAdapter(
                 WristToEEConfig.identity(),
+                smooth_alpha=float(args.hamer_wrist_smooth_alpha),
+                max_step_m=float(args.hamer_wrist_max_step_m),
+                max_step_rad=float(args.hamer_wrist_max_step_rad),
                 relative_position_mode=args.hamer_relative_pos,
                 left_home=np.asarray(args.hamer_left_home, dtype=np.float64),
                 right_home=np.asarray(args.hamer_right_home, dtype=np.float64),
