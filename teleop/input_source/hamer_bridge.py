@@ -19,6 +19,12 @@ class HamerHandBridge:
         kp = np.asarray(kp21, dtype=np.float64).reshape(21, 3).copy()
         kp = kp - kp[0:1, :]
 
+        # GMH-D / MediaPipe 相机系: x右, y下, z前。
+        # dex retargeting 侧需要左右手在“手局部关键点语义”上保持镜像一致；
+        # 否则一侧手指张合向量会方向相反，导致几乎不动或张合反了。
+        if side == "left":
+            kp[:, 0] *= -1.0
+
         ref = _safe_norm(kp[self._middle_mcp_idx])
         scale_raw = self._target_bone_len / ref
         scale_raw = float(np.clip(scale_raw, 0.3, 3.0))
