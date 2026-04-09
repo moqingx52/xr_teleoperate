@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-从 EgoDex 风格 HDF5 读取左右手腕位置，绘制 3D 轨迹（多视角，含正等轴测近似）。
+Load left/right wrist positions from EgoDex-style HDF5 and plot 3D trajectories
+(multiple views, including an approximate isometric view).
 
-不依赖 teleop 包；需要: numpy, h5py, matplotlib
+Standalone script; requires: numpy, h5py, matplotlib
 
-示例:
+Examples:
   cd xr_teleoperate
   python scripts/plot_egodex_wrist_trajectory.py \\
     --hdf5 /path/to/0.hdf5 --root-frame hip --show
@@ -24,7 +25,7 @@ import numpy as np
 try:
     import h5py
 except ModuleNotFoundError:
-    print("需要安装 h5py: pip install h5py", file=sys.stderr)
+    print("Install h5py: pip install h5py", file=sys.stderr)
     sys.exit(1)
 
 
@@ -39,10 +40,7 @@ def load_wrist_positions(
     hdf5_path: str,
     root_frame: str,
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    """
-    返回 (left_xyz, right_xyz, n_frames)，形状均为 (N, 3)。
-    root_frame: world | hip | camera，与 teleop EgoDex 一致。
-    """
+    """Return (left_xyz, right_xyz, n_frames), each (N, 3). root_frame matches teleop EgoDex."""
     root_frame = root_frame.strip().lower()
     if root_frame not in ("world", "hip", "camera"):
         raise ValueError("root_frame must be world, hip, or camera")
@@ -82,7 +80,7 @@ def load_wrist_positions(
 
 
 def _set_equal_3d(ax, pts_list: list[np.ndarray]) -> None:
-    """近似等比例坐标轴，避免 3D 轨迹被压扁。"""
+    """Roughly equal axis scaling so 3D trajectories are not squashed."""
     all_p = np.vstack([p for p in pts_list if p.size])
     if all_p.size == 0:
         return
@@ -117,16 +115,16 @@ def plot_trajectories(
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     views = [
-        ("正等轴测(近似)", 35.264, 45),
-        ("斜俯视", 25, -50),
-        ("俯视 (XY)", 90, -90),
-        ("侧视 (XZ)", 0, 0),
+        ("Isometric (approx.)", 35.264, 45),
+        ("Oblique top", 25, -50),
+        ("Top (XY)", 90, -90),
+        ("Side (XZ)", 0, 0),
     ]
 
     fig = plt.figure(figsize=(11, 10))
     fig.suptitle(
-        f"手腕位置轨迹 (root={root_frame}, N={left.shape[0]})\n"
-        "蓝=左手  橙=右手  灰=起点  绿=终点",
+        f"Wrist position trajectories (root={root_frame}, N={left.shape[0]})\n"
+        "Blue=left  Orange=right  Gray=start  Green=end",
         fontsize=12,
     )
 
@@ -150,7 +148,7 @@ def plot_trajectories(
 
     if out_path:
         plt.savefig(out_path, dpi=150, bbox_inches="tight")
-        print(f"已保存: {out_path}")
+        print(f"Saved: {out_path}")
 
     if show:
         plt.show()
@@ -165,21 +163,21 @@ def main() -> None:
         "--root-frame",
         choices=["world", "hip", "camera"],
         default="hip",
-        help="与 teleop --egodex-root-frame 一致",
+        help="Same as teleop --egodex-root-frame",
     )
-    p.add_argument("-o", "--output", default=None, help="保存 PNG")
-    p.add_argument("--show", action="store_true", help="交互显示窗口")
+    p.add_argument("-o", "--output", default=None, help="Save PNG path")
+    p.add_argument("--show", action="store_true", help="Show interactive window")
     args = p.parse_args()
 
     left, right, n = load_wrist_positions(args.hdf5, args.root_frame)
-    print(f"读取 {n} 帧, root_frame={args.root_frame}")
+    print(f"Loaded {n} frames, root_frame={args.root_frame}")
     print(
-        f"左手 范围 X[{left[:, 0].min():.3f},{left[:, 0].max():.3f}] "
+        f"Left  bounds X[{left[:, 0].min():.3f},{left[:, 0].max():.3f}] "
         f"Y[{left[:, 1].min():.3f},{left[:, 1].max():.3f}] "
         f"Z[{left[:, 2].min():.3f},{left[:, 2].max():.3f}]"
     )
     print(
-        f"右手 范围 X[{right[:, 0].min():.3f},{right[:, 0].max():.3f}] "
+        f"Right bounds X[{right[:, 0].min():.3f},{right[:, 0].max():.3f}] "
         f"Y[{right[:, 1].min():.3f},{right[:, 1].max():.3f}] "
         f"Z[{right[:, 2].min():.3f},{right[:, 2].max():.3f}]"
     )
@@ -188,7 +186,7 @@ def main() -> None:
     if out is None and not args.show:
         base, _ = os.path.splitext(os.path.basename(args.hdf5))
         out = os.path.join(os.getcwd(), f"{base}_wrist_traj_{args.root_frame}.png")
-        print(f"未指定 -o 且未 --show，将保存到: {out}")
+        print(f"No -o and no --show: writing default file: {out}")
 
     plot_trajectories(left, right, args.root_frame, out, args.show)
 
