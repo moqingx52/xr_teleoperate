@@ -23,6 +23,7 @@ class HamerAdapter:
         relative_scale: float = 0.02,
         relative_clip_xyz: Optional[np.ndarray] = None,
         debug_freeze_wrist_rotation: bool = False,
+        debug: bool = False,
     ):
         # relative 模式：位置为 home + scale*(p_ee - p_anchor)；旋转为相对首帧锚点角增量乘同一 scale。
         # relative_compress：仅对缩放后的位置增量做 per-axis clip。
@@ -42,6 +43,7 @@ class HamerAdapter:
         else:
             self.relative_clip_xyz = np.asarray(relative_clip_xyz, dtype=np.float64).reshape(3)
         self.debug_freeze_wrist_rotation = bool(debug_freeze_wrist_rotation)
+        self.debug = bool(debug)
         self._gap_left = 0
         self._gap_right = 0
         self._have_left = False
@@ -140,12 +142,15 @@ class HamerAdapter:
                 prev_p = getattr(self, p_attr).copy()
                 prev_R = getattr(self, R_attr).copy()
                 if getattr(self, have_attr):
-                    p_ee = hf.smooth_vec(prev_p, p_ee, self.smooth_alpha)
+                    if self.smooth_alpha < 1.0:
+                        p_ee = hf.smooth_vec(prev_p, p_ee, self.smooth_alpha)
                     # 旋转按列平滑：先 slerp 近似用 log/exp 在切空间 EMA
                     r_prev = prev_R
                     # 对位置、旋转做步进限幅
-                    p_ee = hf.clamp_translation_step(prev_p, p_ee, self.max_step_m)
-                    R_ee = hf.clamp_rotation_step(r_prev, R_ee, self.max_step_rad)
+                    if self.max_step_m > 0.0:
+                        p_ee = hf.clamp_translation_step(prev_p, p_ee, self.max_step_m)
+                    if self.max_step_rad > 0.0:
+                        R_ee = hf.clamp_rotation_step(r_prev, R_ee, self.max_step_rad)
                 else:
                     p_ee = np.asarray(p_ee, dtype=np.float64).reshape(3)
                     R_ee = np.asarray(R_ee, dtype=np.float64).reshape(3, 3)
@@ -156,10 +161,14 @@ class HamerAdapter:
                     out_left["valid"] = True
                     out_left["p_ee_target"] = p_ee.copy()
                     out_left["R_ee_target"] = R_ee.copy()
+                    if self.debug:
+                        out_left["R_wrist_base"] = np.asarray(R_w, dtype=np.float64).reshape(3, 3).copy()
                 else:
                     out_right["valid"] = True
                     out_right["p_ee_target"] = p_ee.copy()
                     out_right["R_ee_target"] = R_ee.copy()
+                    if self.debug:
+                        out_right["R_wrist_base"] = np.asarray(R_w, dtype=np.float64).reshape(3, 3).copy()
             else:
                 setattr(self, gap_attr, getattr(self, gap_attr) + 1)
                 if getattr(self, gap_attr) > self.max_gap_frames:

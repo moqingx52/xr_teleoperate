@@ -9,6 +9,7 @@ logger_mp = logging_mp.getLogger(__name__)
 import os
 import sys
 import numpy as np
+import pinocchio as pin
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
@@ -111,6 +112,21 @@ def _rpy_deg_to_R_xyz(rpy_deg) -> np.ndarray:
     r, p, y = np.deg2rad(np.asarray(rpy_deg, dtype=np.float64).reshape(3))
     return _rot_x(r) @ _rot_y(p) @ _rot_z(y)
 
+
+def _compute_dual_fk_rotations(arm_ik, q):
+    """Return {'left': R_l, 'right': R_r} from IK model FK, or None if unavailable."""
+    try:
+        model = arm_ik.reduced_robot.model
+        data = arm_ik.reduced_robot.data
+        qv = np.asarray(q, dtype=np.float64).reshape(model.nq)
+        pin.forwardKinematics(model, data, qv)
+        pin.updateFramePlacements(model, data)
+        R_l = np.asarray(data.oMf[arm_ik.L_hand_id].rotation, dtype=np.float64).reshape(3, 3)
+        R_r = np.asarray(data.oMf[arm_ik.R_hand_id].rotation, dtype=np.float64).reshape(3, 3)
+        return {"left": R_l, "right": R_r}
+    except Exception:
+        return None
+
 def build_arg_parser():
     parser = argparse.ArgumentParser()
     # basic control parameters
@@ -127,6 +143,7 @@ def build_arg_parser():
     parser.add_argument('--sim', action='store_true', help='Enable isaac simulation mode')
     parser.add_argument('--ipc', action='store_true', help='Enable IPC server to handle input; otherwise enable sshkeyboard')
     parser.add_argument('--affinity', action='store_true', help='Enable high priority and set CPU affinity mode')
+    parser.add_argument('--debug', action='store_true', help='Enable verbose debug logs for offline wrist->IK chain')
     # record mode and task info
     parser.add_argument('--record', action='store_true', help='Enable data recording mode')
     parser.add_argument('--task-dir', type=str, default='./utils/data/', help='path to save data')
@@ -188,25 +205,25 @@ def build_arg_parser():
         '--hamer-wrist-max-step-m',
         '--hamer_wrist_max_step_m',
         type=float,
-        default=0.03,
+        default=-1.0,
         dest='hamer_wrist_max_step_m',
-        help='HamerAdapter: max wrist/EE translation per control tick (m); smaller = smaller motion range per frame (default 0.03)',
+        help='HamerAdapter: max wrist/EE translation per control tick (m); <=0 disables this limiter (default -1)',
     )
     parser.add_argument(
         '--hamer-wrist-max-step-rad',
         '--hamer_wrist_max_step_rad',
         type=float,
-        default=0.2,
+        default=-1.0,
         dest='hamer_wrist_max_step_rad',
-        help='HamerAdapter: max wrist/EE rotation per tick (rad); smaller = slower orientation changes (default 0.2)',
+        help='HamerAdapter: max wrist/EE rotation per tick (rad); <=0 disables this limiter (default -1)',
     )
     parser.add_argument(
         '--hamer-wrist-smooth-alpha',
         '--hamer_wrist_smooth_alpha',
         type=float,
-        default=0.2,
+        default=1.0,
         dest='hamer_wrist_smooth_alpha',
-        help='HamerAdapter: EMA blend toward new wrist target (0..1); lower = smoother, slower to follow (default 0.2)',
+        help='HamerAdapter: EMA blend toward new wrist target (0..1); 1.0 means no smoothing (default 1.0)',
     )
     parser.add_argument(
         '--hamer-debug-freeze-wrist-rotation',
@@ -238,6 +255,14 @@ def build_arg_parser():
         help='Use transforms/*Hand 3x3 rotation as R_wrist_base (old behavior); default rebuilds wrist frame from knuckles+forearm for IK',
     )
     parser.add_argument(
+        '--wrist-to-ee-json',
+        '--wrist_to_ee_json',
+        type=str,
+        default=None,
+        dest='wrist_to_ee_json',
+        help='Optional JSON calibration for constant wrist->EE transform (preferred over raw RPY flags)',
+    )
+    parser.add_argument(
         '--wrist-left-rpy-deg',
         '--wrist_left_rpy_deg',
         type=float,
@@ -256,6 +281,13 @@ def build_arg_parser():
         dest='wrist_right_rpy_deg',
         metavar=('ROLL_X_DEG', 'PITCH_Y_DEG', 'YAW_Z_DEG'),
         help='WristToEE right constant rotation offset in degrees (XYZ order, applied as R_x@R_y@R_z)',
+    )
+    parser.add_argument(
+        '--disable-ik-joint-smoothing',
+        '--disable_ik_joint_smoothing',
+        action='store_true',
+        dest='disable_ik_joint_smoothing',
+        help='Disable post-IK moving-average smoothing in ArmIK (for latency debugging)',
     )
     return parser
 
@@ -324,6 +356,8 @@ def main(argv=None):
         exit(1)
     if args.input_source == "hamer" and args.hamer_cam2base_json:
         args.hamer_cam2base_json = os.path.abspath(os.path.expanduser(args.hamer_cam2base_json))
+    if args.input_source in ("hamer", "egodex") and args.wrist_to_ee_json:
+        args.wrist_to_ee_json = os.path.abspath(os.path.expanduser(args.wrist_to_ee_json))
     if args.input_source in ("hamer", "egodex") and args.motion and args.input_mode == "controller":
         logger_mp.warning("Offline replay input does not drive locomotion; motion+controller may be inactive.")
 
@@ -388,14 +422,17 @@ def main(argv=None):
             from teleop.input_source.hamer_input import HamerInputSource
             from teleop.input_source.hamer_adapter import HamerAdapter
             from teleop.input_source.hamer_bridge import HamerHandBridge
-            from teleop.input_source.hamer_to_robot_frame import WristToEEConfig
+            from teleop.input_source.hamer_to_robot_frame import WristToEEConfig, load_wrist_to_ee_config_from_json
 
-            wrist_cfg = WristToEEConfig(
+            wrist_cfg_default = WristToEEConfig(
                 t_left=np.zeros(3, dtype=np.float64),
                 R_left=_rpy_deg_to_R_xyz(args.wrist_left_rpy_deg),
                 t_right=np.zeros(3, dtype=np.float64),
                 R_right=_rpy_deg_to_R_xyz(args.wrist_right_rpy_deg),
             )
+            wrist_cfg = wrist_cfg_default
+            if args.wrist_to_ee_json:
+                wrist_cfg = load_wrist_to_ee_config_from_json(args.wrist_to_ee_json, wrist_cfg_default)
             hamer_input = HamerInputSource(
                 json_path=args.hamer_json,
                 score_thresh=args.hamer_score_thresh,
@@ -416,20 +453,24 @@ def main(argv=None):
                 relative_scale=float(args.hamer_relative_scale),
                 relative_clip_xyz=np.asarray(args.hamer_relative_clip, dtype=np.float64),
                 debug_freeze_wrist_rotation=args.hamer_debug_freeze_wrist_rotation,
+                debug=bool(args.debug),
             )
             hamer_hand_bridge = HamerHandBridge(target_bone_len=float(args.hamer_hand_target_bone_len))
         else:
             from teleop.input_source.egodex_input import EgoDexInputSource
             from teleop.input_source.hamer_adapter import HamerAdapter
             from teleop.input_source.hamer_bridge import HamerHandBridge
-            from teleop.input_source.hamer_to_robot_frame import WristToEEConfig
+            from teleop.input_source.hamer_to_robot_frame import WristToEEConfig, load_wrist_to_ee_config_from_json
 
-            wrist_cfg = WristToEEConfig(
+            wrist_cfg_default = WristToEEConfig(
                 t_left=np.zeros(3, dtype=np.float64),
                 R_left=_rpy_deg_to_R_xyz(args.wrist_left_rpy_deg),
                 t_right=np.zeros(3, dtype=np.float64),
                 R_right=_rpy_deg_to_R_xyz(args.wrist_right_rpy_deg),
             )
+            wrist_cfg = wrist_cfg_default
+            if args.wrist_to_ee_json:
+                wrist_cfg = load_wrist_to_ee_config_from_json(args.wrist_to_ee_json, wrist_cfg_default)
             hamer_input = EgoDexInputSource(
                 hdf5_path=args.egodex_hdf5,
                 loop=args.egodex_loop,
@@ -451,6 +492,7 @@ def main(argv=None):
                 relative_scale=float(args.hamer_relative_scale),
                 relative_clip_xyz=np.asarray(args.hamer_relative_clip, dtype=np.float64),
                 debug_freeze_wrist_rotation=args.hamer_debug_freeze_wrist_rotation,
+                debug=bool(args.debug),
             )
             hamer_hand_bridge = HamerHandBridge(target_bone_len=float(args.hamer_hand_target_bone_len))
         
@@ -480,6 +522,11 @@ def main(argv=None):
         elif args.arm == "H1":
             arm_ik = H1_ArmIK()
             arm_ctrl = H1_ArmController(simulation_mode=args.sim)
+        if args.disable_ik_joint_smoothing:
+            if hasattr(arm_ik, "set_joint_smoothing_enabled"):
+                arm_ik.set_joint_smoothing_enabled(False)
+            else:
+                arm_ik.enable_joint_smoothing = False
 
         # end-effector
         if args.ee == "dex3":
@@ -703,6 +750,18 @@ def main(argv=None):
                 if args.swap_hand_input:
                     ll_tf, rr_tf = rr_tf, ll_tf
                 sol_q, sol_tauff = arm_ik.solve_ik(ll_tf, rr_tf, current_lr_arm_q, current_lr_arm_dq)
+                if args.debug:
+                    fk_rot = _compute_dual_fk_rotations(arm_ik, sol_q)
+                    if lt.get("valid", False):
+                        logger_mp.info(f"[debug][left] R_wrist_base=\n{lt.get('R_wrist_base', np.eye(3))}")
+                        logger_mp.info(f"[debug][left] R_ee_target=\n{lt['R_ee_target']}")
+                        if fk_rot is not None:
+                            logger_mp.info(f"[debug][left] R_ee_fk=\n{fk_rot['left']}")
+                    if rt.get("valid", False):
+                        logger_mp.info(f"[debug][right] R_wrist_base=\n{rt.get('R_wrist_base', np.eye(3))}")
+                        logger_mp.info(f"[debug][right] R_ee_target=\n{rt['R_ee_target']}")
+                        if fk_rot is not None:
+                            logger_mp.info(f"[debug][right] R_ee_fk=\n{fk_rot['right']}")
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)

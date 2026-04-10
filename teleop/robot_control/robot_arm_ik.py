@@ -293,8 +293,9 @@ class G1_29_ArmIK:
             # sol = self.opti.solve_limited()
 
             sol_q = self.opti.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
+            if getattr(self, "enable_joint_smoothing", True):
+                self.smooth_filter.add_data(sol_q)
+                sol_q = self.smooth_filter.filtered_data
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
@@ -314,8 +315,9 @@ class G1_29_ArmIK:
             logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
 
             sol_q = self.opti.debug.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
+            if getattr(self, "enable_joint_smoothing", True):
+                self.smooth_filter.add_data(sol_q)
+                sol_q = self.smooth_filter.filtered_data
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
@@ -586,8 +588,9 @@ class G1_23_ArmIK:
             # sol = self.opti.solve_limited()
 
             sol_q = self.opti.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
+            if getattr(self, "enable_joint_smoothing", True):
+                self.smooth_filter.add_data(sol_q)
+                sol_q = self.smooth_filter.filtered_data
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
@@ -607,8 +610,9 @@ class G1_23_ArmIK:
             logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
 
             sol_q = self.opti.debug.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
+            if getattr(self, "enable_joint_smoothing", True):
+                self.smooth_filter.add_data(sol_q)
+                sol_q = self.smooth_filter.filtered_data
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
@@ -904,8 +908,9 @@ class H1_2_ArmIK:
             # sol = self.opti.solve_limited()
 
             sol_q = self.opti.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
+            if getattr(self, "enable_joint_smoothing", True):
+                self.smooth_filter.add_data(sol_q)
+                sol_q = self.smooth_filter.filtered_data
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
@@ -925,8 +930,9 @@ class H1_2_ArmIK:
             logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
 
             sol_q = self.opti.debug.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
+            if getattr(self, "enable_joint_smoothing", True):
+                self.smooth_filter.add_data(sol_q)
+                sol_q = self.smooth_filter.filtered_data
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
@@ -1225,8 +1231,9 @@ class H1_ArmIK:
             # sol = self.opti.solve_limited()
 
             sol_q = self.opti.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
+            if getattr(self, "enable_joint_smoothing", True):
+                self.smooth_filter.add_data(sol_q)
+                sol_q = self.smooth_filter.filtered_data
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
@@ -1246,8 +1253,9 @@ class H1_ArmIK:
             logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
 
             sol_q = self.opti.debug.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
+            if getattr(self, "enable_joint_smoothing", True):
+                self.smooth_filter.add_data(sol_q)
+                sol_q = self.smooth_filter.filtered_data
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
