@@ -234,6 +234,44 @@ def build_arg_parser():
     )
     parser.add_argument('--swap-hand-input', '--swap_hand_input', action='store_true', dest='swap_hand_input',
                         help='Exchange left/right hand skeleton and wrist poses before dex retargeting / arm IK (dataset vs robot LR mismatch)')
+    parser.add_argument(
+        '--disable-hand-hist-stab',
+        '--disable_hand_hist_stab',
+        action='store_true',
+        dest='disable_hand_hist_stab',
+        help='Disable wrist median history outlier rejection for dex hand (25,3) positions (default: enabled)',
+    )
+    parser.add_argument(
+        '--disable-hand-pred-stab',
+        '--disable_hand_pred_stab',
+        action='store_true',
+        dest='disable_hand_pred_stab',
+        help='Disable wrist linear-prediction outlier correction (whole-hand translation; default: enabled)',
+    )
+    parser.add_argument(
+        '--hand-stab-hist-window',
+        '--hand_stab_hist_window',
+        type=int,
+        default=10,
+        dest='hand_stab_hist_window',
+        help='Median history length (frames) for hand wrist outlier gate (default 4)',
+    )
+    parser.add_argument(
+        '--hand-stab-hist-jump-m',
+        '--hand_stab_hist_jump_m',
+        type=float,
+        default=0.25,
+        dest='hand_stab_hist_jump_m',
+        help='Max wrist jump vs median of past frames before rejecting frame (m, default 0.25)',
+    )
+    parser.add_argument(
+        '--hand-stab-pred-dev-m',
+        '--hand_stab_pred_dev_m',
+        type=float,
+        default=0.25,
+        dest='hand_stab_pred_dev_m',
+        help='Max wrist deviation from linear prediction before translating hand to prediction (m, default 0.25)',
+    )
     # EgoDex / offline HDF5 input
     parser.add_argument('--egodex-hdf5', '--egodex_hdf5', type=str, default=None, dest='egodex_hdf5',
                         help='Absolute or relative path to EgoDex episode HDF5 file')
@@ -368,6 +406,7 @@ def main(argv=None):
     ipc_server = None
     listen_keyboard_thread = None
     hamer_input = None
+    hand_pos_stab = None
     try:
         # Real robot: DDS domain 0. Simulation: shm for G1_23/G1_29/H1_2 + dex3/dex1; other combos still need DDS.
         if not args.sim:
@@ -574,6 +613,21 @@ def main(argv=None):
                                            dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
         else:
             pass
+
+        use_hand_ee = args.input_mode == "hand" and args.ee in (
+            "dex3", "inspire_dfx", "inspire_ftp", "brainco",
+        )
+        offline_skip_hand = args.input_source in ("hamer", "egodex") and args.hamer_arm_only
+        if use_hand_ee and not offline_skip_hand:
+            from teleop.utils.hand_pos_temporal_stab import DualHandPosTemporalStabilizer
+
+            hand_pos_stab = DualHandPosTemporalStabilizer(
+                hist_window=args.hand_stab_hist_window,
+                hist_jump_thresh_m=args.hand_stab_hist_jump_m,
+                pred_dev_thresh_m=args.hand_stab_pred_dev_m,
+                enable_hist=not args.disable_hand_hist_stab,
+                enable_pred=not args.disable_hand_pred_stab,
+            )
         
         # affinity mode (if you dont know what it is, then you probably don't need it)
         if args.affinity:
@@ -627,6 +681,8 @@ def main(argv=None):
                 tv_wrapper.render_to_xr(head_img)
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
+        if hand_pos_stab is not None:
+            hand_pos_stab.reset()
         arm_ctrl.speed_gradual_max()
         # main loop. robot start to follow VR user's motion
         while not STOP:
@@ -680,6 +736,8 @@ def main(argv=None):
             ):
                 l_hp = tele_data.left_hand_pos
                 r_hp = tele_data.right_hand_pos
+                if hand_pos_stab is not None:
+                    l_hp, r_hp = hand_pos_stab.stabilize(l_hp, r_hp)
                 if args.swap_hand_input:
                     l_hp, r_hp = r_hp, l_hp
                 with left_hand_pos_array.get_lock():
@@ -694,6 +752,10 @@ def main(argv=None):
                 and not skip_hand_tele
             ):
                 left_hand_pos, right_hand_pos = hamer_hand_bridge.step(hamer_frame)
+                if hand_pos_stab is not None:
+                    left_hand_pos, right_hand_pos = hand_pos_stab.stabilize(
+                        left_hand_pos, right_hand_pos
+                    )
                 if args.swap_hand_input:
                     left_hand_pos, right_hand_pos = right_hand_pos, left_hand_pos
                 with left_hand_pos_array.get_lock():
