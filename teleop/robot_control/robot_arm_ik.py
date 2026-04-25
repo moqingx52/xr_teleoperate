@@ -12,6 +12,7 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 parent2_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(parent2_dir)
+assets_dir = os.path.join(parent2_dir, "assets")
 
 from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 
@@ -34,12 +35,23 @@ class G1_29_ArmIK:
         # fixed cache file path
         self.cache_path = "g1_29_model_cache.pkl"
 
-        if not self.Unit_Test:
-            self.urdf_path = '../assets/g1/g1_body29_hand14.urdf'
-            self.model_dir = '../assets/g1/'
+        default_urdf_path = os.path.join(assets_dir, "g1", "g1_body29_hand14.urdf")
+        default_model_dir = os.path.join(assets_dir, "g1")
+        a2d_urdf_path = os.path.join(assets_dir, "A2D_Omnipicker", "A2D.urdf")
+        a2d_model_dir = os.path.join(assets_dir, "A2D_Omnipicker")
+
+        self._use_a2d_omnipicker_urdf = os.path.exists(a2d_urdf_path)
+        if self._use_a2d_omnipicker_urdf:
+            self.urdf_path = a2d_urdf_path
+            self.model_dir = a2d_model_dir
+            self.cache_path = "g1_29_a2d_omnipicker_model_cache.pkl"
+            logger_mp.info(f"[G1_29_ArmIK] use omnipicker URDF: {self.urdf_path}")
         else:
-            self.urdf_path = '../../assets/g1/g1_body29_hand14.urdf'
-            self.model_dir = '../../assets/g1/'
+            self.urdf_path = default_urdf_path
+            self.model_dir = default_model_dir
+            logger_mp.warning(
+                f"[G1_29_ArmIK] omnipicker URDF not found, fallback to default: {self.urdf_path}"
+            )
 
         # Try loading cache first
         if os.path.exists(self.cache_path) and (not self.Visualization):
@@ -49,59 +61,99 @@ class G1_29_ArmIK:
             logger_mp.info("[G1_29_ArmIK] >>> Loading URDF (slow)...")
             self.robot = pin.RobotWrapper.BuildFromURDF(self.urdf_path, self.model_dir)
 
-            self.mixed_jointsToLockIDs = [
-                                            "left_hip_pitch_joint" ,
-                                            "left_hip_roll_joint" ,
-                                            "left_hip_yaw_joint" ,
-                                            "left_knee_joint" ,
-                                            "left_ankle_pitch_joint" ,
-                                            "left_ankle_roll_joint" ,
-                                            "right_hip_pitch_joint" ,
-                                            "right_hip_roll_joint" ,
-                                            "right_hip_yaw_joint" ,
-                                            "right_knee_joint" ,
-                                            "right_ankle_pitch_joint" ,
-                                            "right_ankle_roll_joint" ,
-                                            "waist_yaw_joint" ,
-                                            "waist_roll_joint" ,
-                                            "waist_pitch_joint" ,
-                                            
-                                            "left_hand_thumb_0_joint" ,
-                                            "left_hand_thumb_1_joint" ,
-                                            "left_hand_thumb_2_joint" ,
-                                            "left_hand_middle_0_joint" ,
-                                            "left_hand_middle_1_joint" ,
-                                            "left_hand_index_0_joint" ,
-                                            "left_hand_index_1_joint" ,
-                                            
-                                            "right_hand_thumb_0_joint" ,
-                                            "right_hand_thumb_1_joint" ,
-                                            "right_hand_thumb_2_joint" ,
-                                            "right_hand_index_0_joint" ,
-                                            "right_hand_index_1_joint" ,
-                                            "right_hand_middle_0_joint",
-                                            "right_hand_middle_1_joint"
-                                        ]
+            if self._use_a2d_omnipicker_urdf:
+                active_arm_joint_names = [
+                    "Joint1_l", "Joint2_l", "Joint3_l", "Joint4_l", "Joint5_l", "Joint6_l", "Joint7_l",
+                    "Joint1_r", "Joint2_r", "Joint3_r", "Joint4_r", "Joint5_r", "Joint6_r", "Joint7_r",
+                ]
+                model_joint_names = set(self.robot.model.names)
+                missing = [n for n in active_arm_joint_names if n not in model_joint_names]
+                if missing:
+                    raise ValueError(
+                        f"[G1_29_ArmIK] omnipicker active arm joints missing in URDF: {missing}"
+                    )
+                # Keep only 14 arm joints movable for IK; lock all other joints.
+                self.mixed_jointsToLockIDs = [
+                    n for n in self.robot.model.names
+                    if n not in active_arm_joint_names and n != "universe"
+                ]
+            else:
+                self.mixed_jointsToLockIDs = [
+                                                "left_hip_pitch_joint" ,
+                                                "left_hip_roll_joint" ,
+                                                "left_hip_yaw_joint" ,
+                                                "left_knee_joint" ,
+                                                "left_ankle_pitch_joint" ,
+                                                "left_ankle_roll_joint" ,
+                                                "right_hip_pitch_joint" ,
+                                                "right_hip_roll_joint" ,
+                                                "right_hip_yaw_joint" ,
+                                                "right_knee_joint" ,
+                                                "right_ankle_pitch_joint" ,
+                                                "right_ankle_roll_joint" ,
+                                                "waist_yaw_joint" ,
+                                                "waist_roll_joint" ,
+                                                "waist_pitch_joint" ,
+                                                
+                                                "left_hand_thumb_0_joint" ,
+                                                "left_hand_thumb_1_joint" ,
+                                                "left_hand_thumb_2_joint" ,
+                                                "left_hand_middle_0_joint" ,
+                                                "left_hand_middle_1_joint" ,
+                                                "left_hand_index_0_joint" ,
+                                                "left_hand_index_1_joint" ,
+                                                
+                                                "right_hand_thumb_0_joint" ,
+                                                "right_hand_thumb_1_joint" ,
+                                                "right_hand_thumb_2_joint" ,
+                                                "right_hand_index_0_joint" ,
+                                                "right_hand_index_1_joint" ,
+                                                "right_hand_middle_0_joint",
+                                                "right_hand_middle_1_joint"
+                                            ]
 
             self.reduced_robot = self.robot.buildReducedRobot(
                 list_of_joints_to_lock=self.mixed_jointsToLockIDs,
                 reference_configuration=np.array([0.0] * self.robot.model.nq),
             )
 
-            self.reduced_robot.model.addFrame(
-                pin.Frame('L_ee',
-                          self.reduced_robot.model.getJointId('left_wrist_yaw_joint'),
-                          pin.SE3(np.eye(3),
-                                  np.array([0.05,0,0]).T),
-                          pin.FrameType.OP_FRAME)
-            )
-            self.reduced_robot.model.addFrame(
-                pin.Frame('R_ee',
-                          self.reduced_robot.model.getJointId('right_wrist_yaw_joint'),
-                          pin.SE3(np.eye(3),
-                                  np.array([0.05,0,0]).T),
-                          pin.FrameType.OP_FRAME)
-            )
+            if self._use_a2d_omnipicker_urdf:
+                # Prefer URDF native hand-base frames as EE.
+                frame_names = [f.name for f in self.reduced_robot.model.frames]
+                if "left_base_link" in frame_names and "right_base_link" in frame_names:
+                    pass
+                else:
+                    self.reduced_robot.model.addFrame(
+                        pin.Frame(
+                            'L_ee',
+                            self.reduced_robot.model.getJointId('Joint7_l'),
+                            pin.SE3(np.eye(3), np.array([0.0, 0.0, 0.0]).T),
+                            pin.FrameType.OP_FRAME
+                        )
+                    )
+                    self.reduced_robot.model.addFrame(
+                        pin.Frame(
+                            'R_ee',
+                            self.reduced_robot.model.getJointId('Joint7_r'),
+                            pin.SE3(np.eye(3), np.array([0.0, 0.0, 0.0]).T),
+                            pin.FrameType.OP_FRAME
+                        )
+                    )
+            else:
+                self.reduced_robot.model.addFrame(
+                    pin.Frame('L_ee',
+                            self.reduced_robot.model.getJointId('left_wrist_yaw_joint'),
+                            pin.SE3(np.eye(3),
+                                    np.array([0.05,0,0]).T),
+                            pin.FrameType.OP_FRAME)
+                )
+                self.reduced_robot.model.addFrame(
+                    pin.Frame('R_ee',
+                            self.reduced_robot.model.getJointId('right_wrist_yaw_joint'),
+                            pin.SE3(np.eye(3),
+                                    np.array([0.05,0,0]).T),
+                            pin.FrameType.OP_FRAME)
+                )
             # Save cache (only after everything is built)
             if not os.path.exists(self.cache_path):
                 self.save_cache()
@@ -123,8 +175,16 @@ class G1_29_ArmIK:
         cpin.framesForwardKinematics(self.cmodel, self.cdata, self.cq)
 
         # Get the hand joint ID and define the error function
-        self.L_hand_id = self.reduced_robot.model.getFrameId("L_ee")
-        self.R_hand_id = self.reduced_robot.model.getFrameId("R_ee")
+        if self._use_a2d_omnipicker_urdf:
+            if "left_base_link" in [f.name for f in self.reduced_robot.model.frames]:
+                self.L_hand_id = self.reduced_robot.model.getFrameId("left_base_link")
+                self.R_hand_id = self.reduced_robot.model.getFrameId("right_base_link")
+            else:
+                self.L_hand_id = self.reduced_robot.model.getFrameId("L_ee")
+                self.R_hand_id = self.reduced_robot.model.getFrameId("R_ee")
+        else:
+            self.L_hand_id = self.reduced_robot.model.getFrameId("L_ee")
+            self.R_hand_id = self.reduced_robot.model.getFrameId("R_ee")
 
         self.translational_error = casadi.Function(
             "translational_error",
@@ -195,7 +255,7 @@ class G1_29_ArmIK:
             self.vis = MeshcatVisualizer(self.reduced_robot.model, self.reduced_robot.collision_model, self.reduced_robot.visual_model)
             self.vis.initViewer(open=True) 
             self.vis.loadViewerModel("pinocchio") 
-            self.vis.displayFrames(True, frame_ids=[107, 108], axis_length = 0.15, axis_width = 5)
+            self.vis.displayFrames(True, frame_ids=[self.L_hand_id, self.R_hand_id], axis_length = 0.15, axis_width = 5)
             self.vis.display(pin.neutral(self.reduced_robot.model))
 
             # Enable the display of end effector target frames with short axis lengths and greater width.
@@ -345,12 +405,8 @@ class G1_23_ArmIK:
         # fixed cache file path
         self.cache_path = "g1_23_model_cache.pkl"
 
-        if not self.Unit_Test:
-            self.urdf_path = '../assets/g1/g1_body23.urdf'
-            self.model_dir = '../assets/g1/'
-        else:
-            self.urdf_path = '../../assets/g1/g1_body23.urdf'
-            self.model_dir = '../../assets/g1/'
+        self.urdf_path = os.path.join(assets_dir, "g1", "g1_body23.urdf")
+        self.model_dir = os.path.join(assets_dir, "g1")
 
         # Try loading cache first
         if os.path.exists(self.cache_path) and (not self.Visualization):
@@ -641,12 +697,8 @@ class H1_2_ArmIK:
         # fixed cache file path
         self.cache_path = "h1_2_model_cache.pkl"
 
-        if not self.Unit_Test:
-            self.urdf_path = '../assets/h1_2/h1_2.urdf'
-            self.model_dir = '../assets/h1_2/'
-        else:
-            self.urdf_path = '../../assets/h1_2/h1_2.urdf'
-            self.model_dir = '../../assets/h1_2/'
+        self.urdf_path = os.path.join(assets_dir, "h1_2", "h1_2.urdf")
+        self.model_dir = os.path.join(assets_dir, "h1_2")
 
         # Try loading cache first
         if os.path.exists(self.cache_path) and (not self.Visualization):
@@ -960,12 +1012,8 @@ class H1_ArmIK:
         # fixed cache file path
         self.cache_path = "h1_model_cache.pkl"
 
-        if not self.Unit_Test:
-            self.urdf_path = '../assets/h1/h1_with_hand.urdf'
-            self.model_dir = '../assets/h1/'
-        else:
-            self.urdf_path = '../../assets/h1/h1_with_hand.urdf'
-            self.model_dir = '../../assets/h1/'
+        self.urdf_path = os.path.join(assets_dir, "h1", "h1_with_hand.urdf")
+        self.model_dir = os.path.join(assets_dir, "h1")
 
         # Try loading cache first
         if os.path.exists(self.cache_path) and (not self.Visualization):

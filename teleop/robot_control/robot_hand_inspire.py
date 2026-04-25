@@ -13,6 +13,8 @@ from enum import IntEnum
 import threading
 import time
 from multiprocessing import Process, Array
+from multiprocessing import Value
+from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 
 import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
@@ -29,6 +31,193 @@ def _denormalize_inspire(idx: int, norm_val: float) -> float:
     if idx == 4:
         return (1.0 - n) * 0.5
     return (1.0 - n) * 1.4 - 0.1
+
+
+class Inspire_Gripper_Controller:
+    """
+    Drive omnipicker dual two-finger grippers through Inspire channels.
+
+    Input values are expected to behave like XR pinch distance in centimeters:
+      - larger value -> more open hand
+      - smaller value -> pinched hand
+    The controller maps this to Inspire normalized command:
+      - open_cmd (typically small, e.g. 0.05)
+      - close_cmd (typically larger, e.g. 0.9)
+    """
+
+    def __init__(
+        self,
+        left_gripper_value_in,
+        right_gripper_value_in,
+        dual_gripper_data_lock=None,
+        dual_gripper_state_out=None,
+        dual_gripper_action_out=None,
+        fps: float = 100.0,
+        simulation_mode: bool = False,
+        input_min: float = 5.0,
+        input_max: float = 7.0,
+        open_cmd: float = 0.05,
+        close_cmd: float = 0.9,
+        smooth_alpha: float = 0.2,
+        max_speed: float = 1.5,
+    ):
+        logger_mp.info("Initialize Inspire_Gripper_Controller...")
+        self.fps = float(fps)
+        self.simulation_mode = bool(simulation_mode)
+
+        self.input_min = float(input_min)
+        self.input_max = float(input_max)
+        if self.input_max <= self.input_min:
+            self.input_max = self.input_min + 1e-3
+        self.open_cmd = float(np.clip(open_cmd, 0.0, 1.2))
+        self.close_cmd = float(np.clip(close_cmd, 0.0, 1.2))
+        self.smooth_alpha = float(np.clip(smooth_alpha, 0.0, 1.0))
+        self.max_speed = float(max(0.0, max_speed))
+
+        self._state_filter = WeightedMovingFilter(np.array([0.5, 0.3, 0.2]), 2)
+
+        self.HandCmb_publisher = None
+        self.HandState_subscriber = None
+        self.inspire_state_shm = None
+        self.inspire_cmd_shm = None
+        self._inspire_state_ready = False
+
+        if self.simulation_mode:
+            self.inspire_state_shm = try_open_shm(SHM_INSPIRE_STATE, SIZE_INSPIRE)
+            self.inspire_cmd_shm = try_open_shm(SHM_INSPIRE_CMD, SIZE_INSPIRE)
+            logger_mp.info("[Inspire_Gripper_Controller] simulation mode: use shared memory state/cmd")
+        else:
+            self.HandCmb_publisher = ChannelPublisher(kTopicInspireDFXCommand, MotorCmds_)
+            self.HandCmb_publisher.Init()
+            self.HandState_subscriber = ChannelSubscriber(kTopicInspireDFXState, MotorStates_)
+            self.HandState_subscriber.Init()
+
+        self.left_gripper_state_value = Value('d', 0.0, lock=True)
+        self.right_gripper_state_value = Value('d', 0.0, lock=True)
+
+        self.subscribe_state_thread = threading.Thread(target=self._subscribe_gripper_state, daemon=True)
+        self.subscribe_state_thread.start()
+
+        while not self._inspire_state_ready:
+            time.sleep(0.01)
+            if self.simulation_mode:
+                logger_mp.warning("[Inspire_Gripper_Controller] Waiting to read inspire shared memory...")
+            else:
+                logger_mp.warning("[Inspire_Gripper_Controller] Waiting to subscribe inspire dds...")
+
+        self.control_thread_handle = threading.Thread(
+            target=self.control_thread,
+            args=(
+                left_gripper_value_in,
+                right_gripper_value_in,
+                self.left_gripper_state_value,
+                self.right_gripper_state_value,
+                dual_gripper_data_lock,
+                dual_gripper_state_out,
+                dual_gripper_action_out,
+            ),
+            daemon=True,
+        )
+        self.control_thread_handle.start()
+        logger_mp.info("Initialize Inspire_Gripper_Controller OK!")
+
+    def _input_to_cmd(self, value: float) -> float:
+        ratio = np.interp(float(value), [self.input_min, self.input_max], [0.0, 1.0])
+        cmd = self.close_cmd + ratio * (self.open_cmd - self.close_cmd)
+        return float(np.clip(cmd, 0.0, 1.2))
+
+    def _subscribe_gripper_state(self):
+        while True:
+            if self.simulation_mode:
+                if self.inspire_state_shm is None:
+                    self.inspire_state_shm = try_open_shm(SHM_INSPIRE_STATE, SIZE_INSPIRE)
+                    time.sleep(0.01)
+                    continue
+                msg = self.inspire_state_shm.read_data()
+                if msg is not None:
+                    q = msg.get("positions", [])
+                    if len(q) >= 12:
+                        left_mean = float(np.mean(np.asarray(q[6:12], dtype=np.float64)))
+                        right_mean = float(np.mean(np.asarray(q[0:6], dtype=np.float64)))
+                        self.left_gripper_state_value.value = left_mean
+                        self.right_gripper_state_value.value = right_mean
+                        self._inspire_state_ready = True
+            else:
+                hand_msg = self.HandState_subscriber.Read()
+                if hand_msg is not None:
+                    left_vals = []
+                    right_vals = []
+                    for i in range(Inspire_Num_Motors):
+                        right_vals.append(float(hand_msg.states[i].q))
+                        left_vals.append(float(hand_msg.states[i + Inspire_Num_Motors].q))
+                    self.left_gripper_state_value.value = float(np.mean(left_vals))
+                    self.right_gripper_state_value.value = float(np.mean(right_vals))
+                    self._inspire_state_ready = True
+            time.sleep(0.002)
+
+    def _publish_cmd(self, left_cmd: float, right_cmd: float):
+        if self.simulation_mode and self.inspire_cmd_shm is not None:
+            cmd_data = {
+                "positions": [float(right_cmd)] * Inspire_Num_Motors + [float(left_cmd)] * Inspire_Num_Motors,
+                "velocities": [0.0] * (Inspire_Num_Motors * 2),
+                "torques": [0.0] * (Inspire_Num_Motors * 2),
+                "kp": [0.0] * (Inspire_Num_Motors * 2),
+                "kd": [0.0] * (Inspire_Num_Motors * 2),
+            }
+            self.inspire_cmd_shm.write_data(cmd_data)
+            return
+
+        hand_msg = MotorCmds_()
+        hand_msg.cmds = [unitree_go_msg_dds__MotorCmd_() for _ in range(Inspire_Num_Motors * 2)]
+        for i in range(Inspire_Num_Motors):
+            hand_msg.cmds[i].q = float(right_cmd)
+            hand_msg.cmds[i + Inspire_Num_Motors].q = float(left_cmd)
+        self.HandCmb_publisher.Write(hand_msg)
+
+    def control_thread(
+        self,
+        left_gripper_value_in,
+        right_gripper_value_in,
+        left_gripper_state_value,
+        right_gripper_state_value,
+        dual_gripper_data_lock=None,
+        dual_gripper_state_out=None,
+        dual_gripper_action_out=None,
+    ):
+        period = 1.0 / max(self.fps, 1.0)
+        max_delta = self.max_speed * period
+        left_cmd = self.open_cmd
+        right_cmd = self.open_cmd
+        while True:
+            t0 = time.time()
+            with left_gripper_value_in.get_lock():
+                left_in = float(left_gripper_value_in.value)
+            with right_gripper_value_in.get_lock():
+                right_in = float(right_gripper_value_in.value)
+
+            left_target = self._input_to_cmd(left_in)
+            right_target = self._input_to_cmd(right_in)
+
+            left_target = left_cmd + self.smooth_alpha * (left_target - left_cmd)
+            right_target = right_cmd + self.smooth_alpha * (right_target - right_cmd)
+
+            left_cmd = float(np.clip(left_target, left_cmd - max_delta, left_cmd + max_delta))
+            right_cmd = float(np.clip(right_target, right_cmd - max_delta, right_cmd + max_delta))
+
+            self._publish_cmd(left_cmd, right_cmd)
+
+            state = np.array([left_gripper_state_value.value, right_gripper_state_value.value], dtype=np.float64)
+            self._state_filter.add_data(state)
+            state_filtered = self._state_filter.filtered_data
+            action = np.array([left_cmd, right_cmd], dtype=np.float64)
+
+            if dual_gripper_state_out is not None and dual_gripper_action_out is not None and dual_gripper_data_lock is not None:
+                with dual_gripper_data_lock:
+                    dual_gripper_state_out[:] = state_filtered
+                    dual_gripper_action_out[:] = action
+
+            dt = time.time() - t0
+            time.sleep(max(0.0, period - dt))
 
 class Inspire_Controller_DFX:
     def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock = None, dual_hand_state_array = None,

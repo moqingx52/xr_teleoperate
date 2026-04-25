@@ -127,6 +127,18 @@ def _compute_dual_fk_rotations(arm_ik, q):
     except Exception:
         return None
 
+
+def _scale_tf_translation(tf: np.ndarray, home_xyz: np.ndarray, scale: float) -> np.ndarray:
+    out = np.asarray(tf, dtype=np.float64).copy().reshape(4, 4)
+    if abs(float(scale) - 1.0) < 1e-12:
+        return out
+    p = out[:3, 3]
+    out[:3, 3] = np.asarray(home_xyz, dtype=np.float64).reshape(3) + float(scale) * (
+        p - np.asarray(home_xyz, dtype=np.float64).reshape(3)
+    )
+    return out
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser()
     # basic control parameters
@@ -134,7 +146,7 @@ def build_arg_parser():
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1'], default='G1_29', help='Select arm controller')
-    parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], help='Select end effector controller')
+    parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'inspire_gripper', 'brainco'], help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # mode flags
@@ -158,6 +170,8 @@ def build_arg_parser():
                         help='xr: TeleVuer; hamer: structured JSON replay; egodex: HDF5 (EgoDex-style) replay')
     parser.add_argument('--hamer-json', '--hamer_json', type=str, default=None, dest='hamer_json',
                         help='Absolute or relative path to structured JSON (demo: out_folder/hamer_structured_results.json)')
+    parser.add_argument('--parquet', '--parquent', type=str, default=None, dest='parquet',
+                        help='Absolute or relative path to replay parquet (dataset/data/chunk-xxx/episode_xxxxxx.parquet)')
     parser.add_argument('--hamer-out-dir', '--hamer_out_dir', type=str, default=None, dest='hamer_out_dir',
                         help='HaMeR demo --out_folder; JSON path becomes <dir>/<hamer_structured_file>')
     parser.add_argument('--hamer-structured-file', '--hamer_structured_file', type=str, default='hamer_structured_results.json',
@@ -327,6 +341,136 @@ def build_arg_parser():
         dest='disable_ik_joint_smoothing',
         help='Disable post-IK moving-average smoothing in ArmIK (for latency debugging)',
     )
+    parser.add_argument(
+        '--arm-reach-scale',
+        '--arm_reach_scale',
+        type=float,
+        default=1.0,
+        dest='arm_reach_scale',
+        help='Scale wrist target translation around per-arm home point for non-default robot arm lengths (1.0 keeps original)',
+    )
+    parser.add_argument(
+        '--arm-left-home',
+        '--arm_left_home',
+        type=float,
+        nargs=3,
+        default=[0.25, 0.25, 0.1],
+        dest='arm_left_home',
+        metavar=('X', 'Y', 'Z'),
+        help='Left home point used by --arm-reach-scale',
+    )
+    parser.add_argument(
+        '--arm-right-home',
+        '--arm_right_home',
+        type=float,
+        nargs=3,
+        default=[0.25, -0.25, 0.1],
+        dest='arm_right_home',
+        metavar=('X', 'Y', 'Z'),
+        help='Right home point used by --arm-reach-scale',
+    )
+    parser.add_argument(
+        '--gripper-input-min',
+        '--gripper_input_min',
+        type=float,
+        default=5.0,
+        dest='gripper_input_min',
+        help='Input value mapped to closed gripper for inspire_gripper/dex1 semantic mode',
+    )
+    parser.add_argument(
+        '--gripper-input-max',
+        '--gripper_input_max',
+        type=float,
+        default=7.0,
+        dest='gripper_input_max',
+        help='Input value mapped to open gripper for inspire_gripper/dex1 semantic mode',
+    )
+    parser.add_argument(
+        '--inspire-gripper-open',
+        '--inspire_gripper_open',
+        type=float,
+        default=0.05,
+        dest='inspire_gripper_open',
+        help='Omnipicker inspire_gripper command value at open state',
+    )
+    parser.add_argument(
+        '--inspire-gripper-close',
+        '--inspire_gripper_close',
+        type=float,
+        default=0.9,
+        dest='inspire_gripper_close',
+        help='Omnipicker inspire_gripper command value at close state',
+    )
+    parser.add_argument(
+        '--inspire-gripper-alpha',
+        '--inspire_gripper_alpha',
+        type=float,
+        default=0.2,
+        dest='inspire_gripper_alpha',
+        help='Low-pass alpha for inspire_gripper command smoothing [0,1]',
+    )
+    parser.add_argument(
+        '--inspire-gripper-max-speed',
+        '--inspire_gripper_max_speed',
+        type=float,
+        default=1.5,
+        dest='inspire_gripper_max_speed',
+        help='Max inspire_gripper command speed (unit/s)',
+    )
+    parser.add_argument(
+        '--omnipicker-gripper-source',
+        '--omnipicker_gripper_source',
+        type=str,
+        choices=['action', 'task'],
+        default='task',
+        dest='omnipicker_gripper_source',
+        help='Offline dex1/inspire_gripper source: action=read scalar from parquet vector, task=derive open/close from subtask text in dataset meta',
+    )
+    parser.add_argument(
+        '--omnipicker-task-meta-dir',
+        '--omnipicker_task_meta_dir',
+        type=str,
+        default=None,
+        dest='omnipicker_task_meta_dir',
+        help='Optional dataset meta directory used by --omnipicker-gripper-source=task (defaults to sibling ./meta inferred from parquet path)',
+    )
+    parser.add_argument(
+        '--omnipicker-gripper-action-key',
+        '--omnipicker_gripper_action_key',
+        type=str,
+        default='action',
+        dest='omnipicker_gripper_action_key',
+        help='Parquet vector key used when --omnipicker-gripper-source=action (e.g. action/original_action/observation.state)',
+    )
+    parser.add_argument(
+        '--omnipicker-gripper-left-idx',
+        '--omnipicker_gripper_left_idx',
+        type=int,
+        default=22,
+        dest='omnipicker_gripper_left_idx',
+        help='Left gripper scalar index inside --omnipicker-gripper-action-key vector',
+    )
+    parser.add_argument(
+        '--omnipicker-gripper-right-idx',
+        '--omnipicker_gripper_right_idx',
+        type=int,
+        default=29,
+        dest='omnipicker_gripper_right_idx',
+        help='Right gripper scalar index inside --omnipicker-gripper-action-key vector',
+    )
+    parser.add_argument(
+        '--hamer-parquet-action-fallback-mode',
+        '--hamer_parquet_action_fallback_mode',
+        type=str,
+        choices=['ee_base', 'wrist_cam'],
+        default='ee_base',
+        dest='hamer_parquet_action_fallback_mode',
+        help=(
+            'When parquet has no left/right kp3d: '
+            'ee_base=use action slices as base-frame EE pose directly; '
+            'wrist_cam=use action slices as camera-frame wrist pose, then apply --hamer-cam2base-json and --wrist-to-ee-json'
+        ),
+    )
     return parser
 
 
@@ -373,6 +517,8 @@ def main(argv=None):
     if args.input_source == "hamer":
         if args.hamer_json:
             args.hamer_json = os.path.abspath(os.path.expanduser(args.hamer_json))
+        if args.parquet:
+            args.parquet = os.path.abspath(os.path.expanduser(args.parquet))
         elif args.hamer_out_dir:
             args.hamer_json = os.path.join(
                 os.path.abspath(os.path.expanduser(args.hamer_out_dir)),
@@ -386,9 +532,19 @@ def main(argv=None):
         if args.replay_fps is None:
             args.frequency = float(args.egodex_fps)
     logger_mp.info(f"args: {args}")
-    if args.input_source == "hamer" and not args.hamer_json:
-        logger_mp.error("HaMeR mode requires --hamer-json/--hamer_json or --hamer-out-dir/--hamer_out_dir")
-        exit(1)
+    if args.input_source == "hamer":
+        has_json = bool(args.hamer_json)
+        has_parquet = bool(args.parquet)
+        if has_json and has_parquet:
+            logger_mp.error("HaMeR mode: --hamer-json and --parquet are mutually exclusive (choose one).")
+            exit(1)
+        if (not has_json) and (not has_parquet):
+            logger_mp.error("HaMeR mode requires one of --hamer-json or --parquet (or --hamer-out-dir).")
+            exit(1)
+    if args.input_source == "hamer" and args.parquet and args.hamer_frame_offset_json:
+        logger_mp.warning("--hamer-frame-offset-json is ignored for --parquet input")
+    if args.input_source == "hamer" and args.parquet and args.hamer_out_dir:
+        logger_mp.warning("--hamer-out-dir is ignored when --parquet is given")
     if args.input_source == "egodex" and not args.egodex_hdf5:
         logger_mp.error("EgoDex mode requires --egodex-hdf5/--egodex_hdf5")
         exit(1)
@@ -398,6 +554,8 @@ def main(argv=None):
         args.wrist_to_ee_json = os.path.abspath(os.path.expanduser(args.wrist_to_ee_json))
     if args.input_source in ("hamer", "egodex") and args.motion and args.input_mode == "controller":
         logger_mp.warning("Offline replay input does not drive locomotion; motion+controller may be inactive.")
+    arm_left_home = np.asarray(args.arm_left_home, dtype=np.float64).reshape(3)
+    arm_right_home = np.asarray(args.arm_right_home, dtype=np.float64).reshape(3)
 
     arm_ctrl = None
     sim_state_subscriber = None
@@ -447,6 +605,8 @@ def main(argv=None):
         last_hamer_left_tf[:3, 3] = np.array([0.25, 0.25, 0.1], dtype=np.float64)
         last_hamer_right_tf = np.eye(4, dtype=np.float64)
         last_hamer_right_tf[:3, 3] = np.array([0.25, -0.25, 0.1], dtype=np.float64)
+        last_left_gripper_input = float(args.gripper_input_max)
+        last_right_gripper_input = float(args.gripper_input_max)
 
         if args.input_source == "xr":
             tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand",
@@ -474,10 +634,17 @@ def main(argv=None):
                 wrist_cfg = load_wrist_to_ee_config_from_json(args.wrist_to_ee_json, wrist_cfg_default)
             hamer_input = HamerInputSource(
                 json_path=args.hamer_json,
+                parquet_path=args.parquet,
                 score_thresh=args.hamer_score_thresh,
                 loop=args.hamer_loop,
                 frame_offset_json=args.hamer_frame_offset_json,
                 cam2base_json=args.hamer_cam2base_json,
+                gripper_action_key=args.omnipicker_gripper_action_key,
+                gripper_left_idx=int(args.omnipicker_gripper_left_idx),
+                gripper_right_idx=int(args.omnipicker_gripper_right_idx),
+                gripper_source=args.omnipicker_gripper_source,
+                omnipicker_task_meta_dir=args.omnipicker_task_meta_dir,
+                parquet_action_fallback_mode=args.hamer_parquet_action_fallback_mode,
             )
             hamer_adapter = HamerAdapter(
                 wrist_cfg,
@@ -568,6 +735,20 @@ def main(argv=None):
                 arm_ik.enable_joint_smoothing = False
 
         # end-effector
+        gripper_input_min = float(args.gripper_input_min)
+        gripper_input_max = float(args.gripper_input_max)
+        if (
+            args.omnipicker_gripper_source in ("action", "task")
+            and abs(gripper_input_min - 5.0) < 1e-12
+            and abs(gripper_input_max - 7.0) < 1e-12
+        ):
+            # Omnipicker gripper sources are normalized in [0,1].
+            gripper_input_min = 0.0
+            gripper_input_max = 1.0
+            logger_mp.info(
+                "[omnipicker] gripper source enabled; auto-set gripper input range to [0, 1]."
+            )
+
         if args.ee == "dex3":
             from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
@@ -586,6 +767,27 @@ def main(argv=None):
             dual_gripper_action_array = Array('d', 2, lock=False)  # current left, right gripper action(2) data.
             gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, 
                                                      dual_gripper_state_array, dual_gripper_action_array, simulation_mode=args.sim)
+        elif args.ee == "inspire_gripper":
+            from teleop.robot_control.robot_hand_inspire import Inspire_Gripper_Controller
+            left_gripper_value = Value('d', 0.0, lock=True)        # [input]
+            right_gripper_value = Value('d', 0.0, lock=True)       # [input]
+            dual_gripper_data_lock = Lock()
+            dual_gripper_state_array = Array('d', 2, lock=False)   # [output]
+            dual_gripper_action_array = Array('d', 2, lock=False)  # [output]
+            gripper_ctrl = Inspire_Gripper_Controller(
+                left_gripper_value,
+                right_gripper_value,
+                dual_gripper_data_lock,
+                dual_gripper_state_array,
+                dual_gripper_action_array,
+                simulation_mode=args.sim,
+                input_min=gripper_input_min,
+                input_max=gripper_input_max,
+                open_cmd=float(args.inspire_gripper_open),
+                close_cmd=float(args.inspire_gripper_close),
+                smooth_alpha=float(args.inspire_gripper_alpha),
+                max_speed=float(args.inspire_gripper_max_speed),
+            )
         elif args.ee == "inspire_dfx":
             from teleop.robot_control.robot_hand_inspire import Inspire_Controller_DFX
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
@@ -762,16 +964,48 @@ def main(argv=None):
                     left_hand_pos_array[:] = left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
                     right_hand_pos_array[:] = right_hand_pos.flatten()
-            elif tele_data is not None and args.ee == "dex1" and args.input_mode == "controller":
+            elif tele_data is not None and args.ee in ("dex1", "inspire_gripper") and args.input_mode == "controller":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
                 with right_gripper_value.get_lock():
                     right_gripper_value.value = tele_data.right_ctrl_triggerValue
-            elif tele_data is not None and args.ee == "dex1" and args.input_mode == "hand":
+            elif tele_data is not None and args.ee in ("dex1", "inspire_gripper") and args.input_mode == "hand":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_hand_pinchValue
                 with right_gripper_value.get_lock():
                     right_gripper_value.value = tele_data.right_hand_pinchValue
+            elif (
+                args.input_source in ("hamer", "egodex")
+                and hamer_frame is not None
+                and args.ee in ("dex1", "inspire_gripper")
+                and args.input_mode == "hand"
+                and not skip_hand_tele
+            ):
+                left_in = None
+                right_in = None
+                left_raw = hamer_frame.get("left", {}).get("gripper_input")
+                right_raw = hamer_frame.get("right", {}).get("gripper_input")
+                try:
+                    if left_raw is not None and np.isfinite(float(left_raw)):
+                        left_in = float(left_raw)
+                except (TypeError, ValueError):
+                    left_in = None
+                try:
+                    if right_raw is not None and np.isfinite(float(right_raw)):
+                        right_in = float(right_raw)
+                except (TypeError, ValueError):
+                    right_in = None
+                if left_in is None:
+                    left_in = float(last_left_gripper_input)
+                if right_in is None:
+                    right_in = float(last_right_gripper_input)
+
+                last_left_gripper_input = left_in
+                last_right_gripper_input = right_in
+                with left_gripper_value.get_lock():
+                    left_gripper_value.value = left_in
+                with right_gripper_value.get_lock():
+                    right_gripper_value.value = right_in
             else:
                 pass
             
@@ -800,6 +1034,8 @@ def main(argv=None):
                 rw = tele_data.right_wrist_pose
                 if args.swap_hand_input:
                     lw, rw = rw, lw
+                lw = _scale_tf_translation(lw, arm_left_home, args.arm_reach_scale)
+                rw = _scale_tf_translation(rw, arm_right_home, args.arm_reach_scale)
                 sol_q, sol_tauff = arm_ik.solve_ik(lw, rw, current_lr_arm_q, current_lr_arm_dq)
             elif args.input_source in ("hamer", "egodex"):
                 targets = hamer_adapter.step(hamer_frame, current_lr_arm_q)
@@ -811,6 +1047,8 @@ def main(argv=None):
                 ll_tf, rr_tf = last_hamer_left_tf, last_hamer_right_tf
                 if args.swap_hand_input:
                     ll_tf, rr_tf = rr_tf, ll_tf
+                ll_tf = _scale_tf_translation(ll_tf, arm_left_home, args.arm_reach_scale)
+                rr_tf = _scale_tf_translation(rr_tf, arm_right_home, args.arm_reach_scale)
                 sol_q, sol_tauff = arm_ik.solve_ik(ll_tf, rr_tf, current_lr_arm_q, current_lr_arm_dq)
                 if args.debug:
                     fk_rot = _compute_dual_fk_rotations(arm_ik, sol_q)
@@ -840,7 +1078,7 @@ def main(argv=None):
                         right_hand_action = dual_hand_action_array[-7:]
                         current_body_state = []
                         current_body_action = []
-                elif args.ee == "dex1" and args.input_mode == "hand":
+                elif args.ee in ("dex1", "inspire_gripper") and args.input_mode == "hand":
                     with dual_gripper_data_lock:
                         left_ee_state = [dual_gripper_state_array[0]]
                         right_ee_state = [dual_gripper_state_array[1]]
@@ -848,7 +1086,7 @@ def main(argv=None):
                         right_hand_action = [dual_gripper_action_array[1]]
                         current_body_state = []
                         current_body_action = []
-                elif args.ee == "dex1" and args.input_mode == "controller" and tele_data is not None:
+                elif args.ee in ("dex1", "inspire_gripper") and args.input_mode == "controller" and tele_data is not None:
                     with dual_gripper_data_lock:
                         left_ee_state = [dual_gripper_state_array[0]]
                         right_ee_state = [dual_gripper_state_array[1]]

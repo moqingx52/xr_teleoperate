@@ -105,13 +105,21 @@ class HamerAdapter:
             valid = self._side_valid(sd)
             if valid:
                 setattr(self, gap_attr, 0)
-                p_w = sd["p_wrist_base"]
-                R_w = sd["R_wrist_base"]
-                if self.mirror_lr_across_xz:
-                    # Correct order for symmetric remap:
-                    # 1) swap side source, 2) mirror wrist pose across robot xz plane, 3) apply target-side wrist->ee calibration.
-                    p_w, R_w = self._mirror_across_xz(p_w, R_w)
-                p_ee, R_ee = wrist_to_ee_target(ee_side, p_w, R_w, self.wrist_calib)
+                if ("p_ee_base" in sd) and ("R_ee_base" in sd):
+                    # Some parquet datasets store EE pose directly (not wrist pose).
+                    p_ee = np.asarray(sd["p_ee_base"], dtype=np.float64).reshape(3)
+                    R_ee = np.asarray(sd["R_ee_base"], dtype=np.float64).reshape(3, 3)
+                    if self.mirror_lr_across_xz:
+                        p_ee, R_ee = self._mirror_across_xz(p_ee, R_ee)
+                    R_w = None
+                else:
+                    p_w = sd["p_wrist_base"]
+                    R_w = sd["R_wrist_base"]
+                    if self.mirror_lr_across_xz:
+                        # Correct order for symmetric remap:
+                        # 1) swap side source, 2) mirror wrist pose across robot xz plane, 3) apply target-side wrist->ee calibration.
+                        p_w, R_w = self._mirror_across_xz(p_w, R_w)
+                    p_ee, R_ee = wrist_to_ee_target(ee_side, p_w, R_w, self.wrist_calib)
                 if self.relative_position_mode:
                     if side_key == "left":
                         if self._anchor_l is None:
@@ -161,13 +169,13 @@ class HamerAdapter:
                     out_left["valid"] = True
                     out_left["p_ee_target"] = p_ee.copy()
                     out_left["R_ee_target"] = R_ee.copy()
-                    if self.debug:
+                    if self.debug and R_w is not None:
                         out_left["R_wrist_base"] = np.asarray(R_w, dtype=np.float64).reshape(3, 3).copy()
                 else:
                     out_right["valid"] = True
                     out_right["p_ee_target"] = p_ee.copy()
                     out_right["R_ee_target"] = R_ee.copy()
-                    if self.debug:
+                    if self.debug and R_w is not None:
                         out_right["R_wrist_base"] = np.asarray(R_w, dtype=np.float64).reshape(3, 3).copy()
             else:
                 setattr(self, gap_attr, getattr(self, gap_attr) + 1)

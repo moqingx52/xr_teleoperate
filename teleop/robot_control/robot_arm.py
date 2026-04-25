@@ -32,6 +32,40 @@ G1_29_Num_Motors = 35
 G1_23_Num_Motors = 35
 H1_2_Num_Motors = 35
 H1_Num_Motors = 20
+
+DEFAULT_G1_29_ARM_JOINT_NAMES = [
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+]
+
+OMNIPICKER_G1_29_ARM_JOINT_NAMES = [
+    "idx21_arm_l_joint1",
+    "idx22_arm_l_joint2",
+    "idx23_arm_l_joint3",
+    "idx24_arm_l_joint4",
+    "idx25_arm_l_joint5",
+    "idx26_arm_l_joint6",
+    "idx27_arm_l_joint7",
+    "idx61_arm_r_joint1",
+    "idx62_arm_r_joint2",
+    "idx63_arm_r_joint3",
+    "idx64_arm_r_joint4",
+    "idx65_arm_r_joint5",
+    "idx66_arm_r_joint6",
+    "idx67_arm_r_joint7",
+]
  
 
 class MotorState:
@@ -143,6 +177,8 @@ class G1_29_ArmController:
         self._last_q = [0.0] * G1_29_Num_Motors
         self._last_dq = [0.0] * G1_29_Num_Motors
         self._sim_lowstate_none_count = 0
+        self._sim_joint_name_to_slot = None
+        self._sim_joint_mapping_name = "index"
 
         # initialize subscribe thread
         self.subscribe_thread = threading.Thread(target=self._subscribe_motor_state)
@@ -199,6 +235,51 @@ class G1_29_ArmController:
 
         logger_mp.info("Initialize G1_29_ArmController OK!")
 
+    def _build_sim_joint_name_mapping(self, joint_names):
+        names = [str(n) for n in (joint_names or [])]
+        name_set = set(names)
+        arm_slots = [int(m.value) for m in G1_29_JointArmIndex]
+        if all(n in name_set for n in OMNIPICKER_G1_29_ARM_JOINT_NAMES):
+            mapping = {
+                joint_name: arm_slots[idx]
+                for idx, joint_name in enumerate(OMNIPICKER_G1_29_ARM_JOINT_NAMES)
+            }
+            self._sim_joint_mapping_name = "omnipicker-named"
+            logger_mp.info(
+                "[G1_29_ArmController] simulation state uses omnipicker named arm joints."
+            )
+            return mapping
+        if all(n in name_set for n in DEFAULT_G1_29_ARM_JOINT_NAMES):
+            mapping = {
+                joint_name: arm_slots[idx]
+                for idx, joint_name in enumerate(DEFAULT_G1_29_ARM_JOINT_NAMES)
+            }
+            self._sim_joint_mapping_name = "g1-named"
+            logger_mp.info(
+                "[G1_29_ArmController] simulation state uses default G1 named arm joints."
+            )
+            return mapping
+        return None
+
+    def _update_sim_state_from_named_joints(self, q_safe, dq_safe, joint_names):
+        if not isinstance(joint_names, list) or len(joint_names) == 0:
+            return False
+        if self._sim_joint_name_to_slot is None:
+            self._sim_joint_name_to_slot = self._build_sim_joint_name_mapping(joint_names)
+        mapping = self._sim_joint_name_to_slot
+        if not mapping:
+            return False
+        name_to_idx = {str(n): i for i, n in enumerate(joint_names)}
+        for joint_name, slot in mapping.items():
+            idx = name_to_idx.get(joint_name, None)
+            if idx is None:
+                continue
+            if idx < len(q_safe) and q_safe[idx] is not None:
+                self._last_q[slot] = _safe_float(q_safe[idx], self._last_q[slot])
+            if idx < len(dq_safe) and dq_safe[idx] is not None:
+                self._last_dq[slot] = _safe_float(dq_safe[idx], self._last_dq[slot])
+        return True
+
     def _subscribe_motor_state(self):
         _read_n = 0
         while True:
@@ -223,14 +304,20 @@ class G1_29_ArmController:
                         if q is None or dq is None:
                             time.sleep(0.002)
                             continue
+                        joint_names = msg.get("joint_names")
                         lowstate = G1_29_LowState()
                         q_safe = list(q) if q is not None else []
                         dq_safe = list(dq) if dq is not None else []
+                        used_named_mapping = self._update_sim_state_from_named_joints(
+                            q_safe, dq_safe, joint_names
+                        )
+                        if not used_named_mapping:
+                            for id in range(G1_29_Num_Motors):
+                                if id < len(q_safe) and q_safe[id] is not None:
+                                    self._last_q[id] = _safe_float(q_safe[id], self._last_q[id])
+                                if id < len(dq_safe) and dq_safe[id] is not None:
+                                    self._last_dq[id] = _safe_float(dq_safe[id], self._last_dq[id])
                         for id in range(G1_29_Num_Motors):
-                            if id < len(q_safe) and q_safe[id] is not None:
-                                self._last_q[id] = _safe_float(q_safe[id], self._last_q[id])
-                            if id < len(dq_safe) and dq_safe[id] is not None:
-                                self._last_dq[id] = _safe_float(dq_safe[id], self._last_dq[id])
                             lowstate.motor_state[id].q = self._last_q[id]
                             lowstate.motor_state[id].dq = self._last_dq[id]
                         self.lowstate_buffer.SetData(lowstate)
