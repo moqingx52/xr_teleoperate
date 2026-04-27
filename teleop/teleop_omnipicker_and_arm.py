@@ -9,6 +9,7 @@ Omnipicker 专用入口。
 - sim: true
 - input-source: hamer（离线回放）
 - input-mode: hand（把输入手部关键点语义映射到二指夹爪开合）
+- arm-control-source: joint（默认直发关节，不走项目内 IK）
 
 离线回放（input-source=hamer）支持：
 - JSON: --hamer-json
@@ -21,6 +22,7 @@ Omnipicker 专用入口。
 - --cam2base-json -> --hamer-cam2base-json
 - --wrist2ee-json -> --wrist-to-ee-json
 - --parquet-action-fallback-mode -> --hamer-parquet-action-fallback-mode
+- --use-ik -> --hamer-arm-control-source ik
 
 其余参数均透传给 teleop_hand_and_arm.py。
 """
@@ -108,6 +110,7 @@ def run_omnipicker(argv=None):
     args = _rewrite_aliases(args)
 
     injected = []
+    use_ik = _argv_pop_flag(args, {"--use-ik", "--use_ik"})
     force_real = _argv_pop_flag(args, {"--real", "--no-sim", "--no_sim"})
 
     if not _argv_has(args, "--arm"):
@@ -140,6 +143,10 @@ def run_omnipicker(argv=None):
         # treat slices as camera-frame wrist pose and still apply cam2base + wrist->EE.
         if has_parquet and (not _argv_has(effective, "--hamer-parquet-action-fallback-mode")):
             effective += ["--hamer-parquet-action-fallback-mode", "wrist_cam"]
+        # Omnipicker default: direct arm joint command from parquet, not ee-pose IK.
+        # Add --use-ik (or --hamer-arm-control-source ik) to explicitly enable IK.
+        if has_parquet and (not _argv_has(effective, "--hamer-arm-control-source")):
+            effective += ["--hamer-arm-control-source", "ik" if use_ik else "joint"]
 
     _get_teleop_main()(effective)
 

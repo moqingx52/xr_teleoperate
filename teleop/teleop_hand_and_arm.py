@@ -459,6 +459,43 @@ def build_arg_parser():
         help='Right gripper scalar index inside --omnipicker-gripper-action-key vector',
     )
     parser.add_argument(
+        '--hamer-arm-control-source',
+        '--hamer_arm_control_source',
+        type=str,
+        choices=['ik', 'joint'],
+        default='ik',
+        dest='hamer_arm_control_source',
+        help='Offline arm source in HaMeR parquet replay: ik=use wrist->IK, joint=directly send joint targets from parquet vector',
+    )
+    parser.add_argument(
+        '--omnipicker-joint-action-key',
+        '--omnipicker_joint_action_key',
+        type=str,
+        default='action',
+        dest='omnipicker_joint_action_key',
+        help='Parquet vector key used when --hamer-arm-control-source=joint (e.g. action/original_action/observation.state)',
+    )
+    parser.add_argument(
+        '--omnipicker-joint-left-range',
+        '--omnipicker_joint_left_range',
+        type=int,
+        nargs=2,
+        default=[0, 7],
+        metavar=('START', 'END'),
+        dest='omnipicker_joint_left_range',
+        help='Left arm joint slice [start,end) in --omnipicker-joint-action-key vector',
+    )
+    parser.add_argument(
+        '--omnipicker-joint-right-range',
+        '--omnipicker_joint_right_range',
+        type=int,
+        nargs=2,
+        default=[8, 15],
+        metavar=('START', 'END'),
+        dest='omnipicker_joint_right_range',
+        help='Right arm joint slice [start,end) in --omnipicker-joint-action-key vector',
+    )
+    parser.add_argument(
         '--hamer-parquet-action-fallback-mode',
         '--hamer_parquet_action_fallback_mode',
         type=str,
@@ -545,6 +582,19 @@ def main(argv=None):
         logger_mp.warning("--hamer-frame-offset-json is ignored for --parquet input")
     if args.input_source == "hamer" and args.parquet and args.hamer_out_dir:
         logger_mp.warning("--hamer-out-dir is ignored when --parquet is given")
+    if (
+        args.input_source == "hamer"
+        and args.hamer_arm_control_source == "joint"
+        and not args.parquet
+    ):
+        logger_mp.error("--hamer-arm-control-source=joint currently requires --parquet input.")
+        exit(1)
+    if args.hamer_arm_control_source == "joint":
+        ll = [int(v) for v in args.omnipicker_joint_left_range]
+        rr = [int(v) for v in args.omnipicker_joint_right_range]
+        if ll[0] < 0 or rr[0] < 0 or ll[1] <= ll[0] or rr[1] <= rr[0]:
+            logger_mp.error("Invalid joint range: require non-negative [start,end) with end>start.")
+            exit(1)
     if args.input_source == "egodex" and not args.egodex_hdf5:
         logger_mp.error("EgoDex mode requires --egodex-hdf5/--egodex_hdf5")
         exit(1)
@@ -645,6 +695,11 @@ def main(argv=None):
                 gripper_source=args.omnipicker_gripper_source,
                 omnipicker_task_meta_dir=args.omnipicker_task_meta_dir,
                 parquet_action_fallback_mode=args.hamer_parquet_action_fallback_mode,
+                joint_action_key=args.omnipicker_joint_action_key,
+                joint_left_start=int(args.omnipicker_joint_left_range[0]),
+                joint_left_end=int(args.omnipicker_joint_left_range[1]),
+                joint_right_start=int(args.omnipicker_joint_right_range[0]),
+                joint_right_end=int(args.omnipicker_joint_right_range[1]),
             )
             hamer_adapter = HamerAdapter(
                 wrist_cfg,
@@ -886,6 +941,16 @@ def main(argv=None):
         if hand_pos_stab is not None:
             hand_pos_stab.reset()
         arm_ctrl.speed_gradual_max()
+        direct_joint_mode = (
+            args.input_source == "hamer"
+            and bool(args.parquet)
+            and args.hamer_arm_control_source == "joint"
+        )
+        if direct_joint_mode:
+            logger_mp.info(
+                "[omnipicker] arm control source: joint (skip IK, direct ctrl_dual_arm from parquet)."
+            )
+        _joint_target_warned = False
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
@@ -1038,30 +1103,64 @@ def main(argv=None):
                 rw = _scale_tf_translation(rw, arm_right_home, args.arm_reach_scale)
                 sol_q, sol_tauff = arm_ik.solve_ik(lw, rw, current_lr_arm_q, current_lr_arm_dq)
             elif args.input_source in ("hamer", "egodex"):
-                targets = hamer_adapter.step(hamer_frame, current_lr_arm_q)
-                lt, rt = targets["left_arm"], targets["right_arm"]
-                if lt["valid"]:
-                    last_hamer_left_tf = homogeneous_from_position_rotation(lt["p_ee_target"], lt["R_ee_target"])
-                if rt["valid"]:
-                    last_hamer_right_tf = homogeneous_from_position_rotation(rt["p_ee_target"], rt["R_ee_target"])
-                ll_tf, rr_tf = last_hamer_left_tf, last_hamer_right_tf
-                if args.swap_hand_input:
-                    ll_tf, rr_tf = rr_tf, ll_tf
-                ll_tf = _scale_tf_translation(ll_tf, arm_left_home, args.arm_reach_scale)
-                rr_tf = _scale_tf_translation(rr_tf, arm_right_home, args.arm_reach_scale)
-                sol_q, sol_tauff = arm_ik.solve_ik(ll_tf, rr_tf, current_lr_arm_q, current_lr_arm_dq)
-                if args.debug:
-                    fk_rot = _compute_dual_fk_rotations(arm_ik, sol_q)
-                    if lt.get("valid", False):
-                        logger_mp.info(f"[debug][left] R_wrist_base=\n{lt.get('R_wrist_base', np.eye(3))}")
-                        logger_mp.info(f"[debug][left] R_ee_target=\n{lt['R_ee_target']}")
-                        if fk_rot is not None:
-                            logger_mp.info(f"[debug][left] R_ee_fk=\n{fk_rot['left']}")
-                    if rt.get("valid", False):
-                        logger_mp.info(f"[debug][right] R_wrist_base=\n{rt.get('R_wrist_base', np.eye(3))}")
-                        logger_mp.info(f"[debug][right] R_ee_target=\n{rt['R_ee_target']}")
-                        if fk_rot is not None:
-                            logger_mp.info(f"[debug][right] R_ee_fk=\n{fk_rot['right']}")
+                if direct_joint_mode:
+                    l_joint = None
+                    r_joint = None
+                    if hamer_frame is not None:
+                        jt = hamer_frame.get("joint_target", {})
+                        l_joint = jt.get("left")
+                        r_joint = jt.get("right")
+                    if l_joint is not None and r_joint is not None:
+                        l_joint = np.asarray(l_joint, dtype=np.float64).reshape(-1)
+                        r_joint = np.asarray(r_joint, dtype=np.float64).reshape(-1)
+                        direct_q = np.concatenate([l_joint, r_joint], axis=0)
+                        if direct_q.size == current_lr_arm_q.size:
+                            sol_q = direct_q
+                            sol_tauff = np.zeros_like(current_lr_arm_q, dtype=np.float64)
+                        else:
+                            if not _joint_target_warned:
+                                logger_mp.warning(
+                                    "[omnipicker] direct joint target size mismatch: "
+                                    f"got {direct_q.size}, expected {current_lr_arm_q.size}. "
+                                    "Fallback to keep current arm q."
+                                )
+                                _joint_target_warned = True
+                            sol_q = current_lr_arm_q
+                            sol_tauff = np.zeros_like(current_lr_arm_q, dtype=np.float64)
+                    else:
+                        if not _joint_target_warned:
+                            logger_mp.warning(
+                                "[omnipicker] direct joint mode has no joint_target in frame; "
+                                "fallback to keep current arm q."
+                            )
+                            _joint_target_warned = True
+                        sol_q = current_lr_arm_q
+                        sol_tauff = np.zeros_like(current_lr_arm_q, dtype=np.float64)
+                else:
+                    targets = hamer_adapter.step(hamer_frame, current_lr_arm_q)
+                    lt, rt = targets["left_arm"], targets["right_arm"]
+                    if lt["valid"]:
+                        last_hamer_left_tf = homogeneous_from_position_rotation(lt["p_ee_target"], lt["R_ee_target"])
+                    if rt["valid"]:
+                        last_hamer_right_tf = homogeneous_from_position_rotation(rt["p_ee_target"], rt["R_ee_target"])
+                    ll_tf, rr_tf = last_hamer_left_tf, last_hamer_right_tf
+                    if args.swap_hand_input:
+                        ll_tf, rr_tf = rr_tf, ll_tf
+                    ll_tf = _scale_tf_translation(ll_tf, arm_left_home, args.arm_reach_scale)
+                    rr_tf = _scale_tf_translation(rr_tf, arm_right_home, args.arm_reach_scale)
+                    sol_q, sol_tauff = arm_ik.solve_ik(ll_tf, rr_tf, current_lr_arm_q, current_lr_arm_dq)
+                    if args.debug:
+                        fk_rot = _compute_dual_fk_rotations(arm_ik, sol_q)
+                        if lt.get("valid", False):
+                            logger_mp.info(f"[debug][left] R_wrist_base=\n{lt.get('R_wrist_base', np.eye(3))}")
+                            logger_mp.info(f"[debug][left] R_ee_target=\n{lt['R_ee_target']}")
+                            if fk_rot is not None:
+                                logger_mp.info(f"[debug][left] R_ee_fk=\n{fk_rot['left']}")
+                        if rt.get("valid", False):
+                            logger_mp.info(f"[debug][right] R_wrist_base=\n{rt.get('R_wrist_base', np.eye(3))}")
+                            logger_mp.info(f"[debug][right] R_ee_target=\n{rt['R_ee_target']}")
+                            if fk_rot is not None:
+                                logger_mp.info(f"[debug][right] R_ee_fk=\n{fk_rot['right']}")
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)

@@ -157,13 +157,10 @@ class Inspire_Gripper_Controller:
 
     def _publish_cmd(self, left_cmd: float, right_cmd: float):
         if self.simulation_mode and self.inspire_cmd_shm is not None:
-            cmd_data = {
-                "positions": [float(right_cmd)] * Inspire_Num_Motors + [float(left_cmd)] * Inspire_Num_Motors,
-                "velocities": [0.0] * (Inspire_Num_Motors * 2),
-                "torques": [0.0] * (Inspire_Num_Motors * 2),
-                "kp": [0.0] * (Inspire_Num_Motors * 2),
-                "kd": [0.0] * (Inspire_Num_Motors * 2),
-            }
+            # Keep shm payload minimal and compatible with JoySim InspireDDS:
+            # {"positions": [...]} is treated as direct normalized command.
+            # Extra keys (velocities/torques/kp/kd) may trigger XR remap path.
+            cmd_data = {"positions": [float(right_cmd)] * Inspire_Num_Motors + [float(left_cmd)] * Inspire_Num_Motors}
             self.inspire_cmd_shm.write_data(cmd_data)
             return
 

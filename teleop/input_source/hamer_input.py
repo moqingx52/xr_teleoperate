@@ -446,6 +446,11 @@ class HamerParquetReader:
         action_fallback_mode: str = "ee_base",
         gripper_source: str = "action",
         task_meta_dir: Optional[str] = None,
+        joint_action_key: str = "action",
+        joint_left_start: int = 0,
+        joint_left_end: int = 7,
+        joint_right_start: int = 8,
+        joint_right_end: int = 15,
     ):
         self.parquet_path = os.path.abspath(parquet_path)
         self.loop = bool(loop)
@@ -456,6 +461,11 @@ class HamerParquetReader:
         self.gripper_right_idx = int(gripper_right_idx)
         self.action_fallback_mode = str(action_fallback_mode)
         self.gripper_source = str(gripper_source)
+        self.joint_action_key = str(joint_action_key)
+        self.joint_left_start = int(joint_left_start)
+        self.joint_left_end = int(joint_left_end)
+        self.joint_right_start = int(joint_right_start)
+        self.joint_right_end = int(joint_right_end)
         if self.gripper_source not in ("action", "task"):
             raise ValueError(
                 f"Unknown gripper_source: {self.gripper_source}. Expected one of: action, task."
@@ -496,6 +506,7 @@ class HamerParquetReader:
         frame_col = _choose_col(columns, ["frame_index", "episode_frame_index"])
         ts_col = _choose_col(columns, ["timestamp"])
         gripper_col = _choose_col(columns, [self.gripper_action_key])
+        joint_col = _choose_col(columns, [self.joint_action_key])
         subtask_col = _choose_col(columns, ["subtask_index", "annotation.human.subtask_description"])
         arm_pose_col = _choose_col(
             columns,
@@ -539,6 +550,11 @@ class HamerParquetReader:
                     f"[HamerParquetReader] gripper action key '{self.gripper_action_key}' not found; "
                     "offline gripper input will keep previous value."
                 )
+        if joint_col is None:
+            logger_mp.warning(
+                f"[HamerParquetReader] joint action key '{self.joint_action_key}' not found; "
+                "offline direct-joint mode will not have joint targets."
+            )
         if self.gripper_source == "task" and subtask_col is None:
             raise ValueError(
                 "[HamerParquetReader] gripper_source=task requires parquet column `subtask_index`."
@@ -551,7 +567,27 @@ class HamerParquetReader:
             fi = int(row[frame_col]) if frame_col is not None else int(i)
             ts = float(row[ts_col]) if ts_col is not None else 0.0
 
-            frame = {"frame_idx": fi, "timestamp_sec": ts, "left": {"valid": False}, "right": {"valid": False}}
+            frame = {
+                "frame_idx": fi,
+                "timestamp_sec": ts,
+                "left": {"valid": False},
+                "right": {"valid": False},
+                "joint_target": {"left": None, "right": None},
+            }
+
+            if joint_col is not None:
+                joint_arr = np.asarray(row[joint_col], dtype=np.float64).reshape(-1)
+                if joint_arr.size >= max(self.joint_left_end, self.joint_right_end):
+                    l_joint = joint_arr[self.joint_left_start:self.joint_left_end]
+                    r_joint = joint_arr[self.joint_right_start:self.joint_right_end]
+                    if (
+                        l_joint.size == (self.joint_left_end - self.joint_left_start)
+                        and r_joint.size == (self.joint_right_end - self.joint_right_start)
+                        and np.all(np.isfinite(l_joint))
+                        and np.all(np.isfinite(r_joint))
+                    ):
+                        frame["joint_target"]["left"] = np.asarray(l_joint, dtype=np.float64).copy()
+                        frame["joint_target"]["right"] = np.asarray(r_joint, dtype=np.float64).copy()
 
             left_gripper = None
             right_gripper = None
@@ -663,6 +699,7 @@ class HamerParquetReader:
             "timestamp_sec": out["timestamp_sec"],
             "left": out["left"],
             "right": out["right"],
+            "joint_target": out.get("joint_target", {"left": None, "right": None}),
         }
 
     def reset(self):
@@ -686,6 +723,11 @@ class HamerInputSource:
         gripper_source: str = "action",
         omnipicker_task_meta_dir: Optional[str] = None,
         parquet_action_fallback_mode: str = "ee_base",
+        joint_action_key: str = "action",
+        joint_left_start: int = 0,
+        joint_left_end: int = 7,
+        joint_right_start: int = 8,
+        joint_right_end: int = 15,
     ):
         if bool(json_path) == bool(parquet_path):
             raise ValueError("Provide exactly one of json_path or parquet_path")
@@ -716,6 +758,11 @@ class HamerInputSource:
                 gripper_source=gripper_source,
                 task_meta_dir=omnipicker_task_meta_dir,
                 action_fallback_mode=parquet_action_fallback_mode,
+                joint_action_key=joint_action_key,
+                joint_left_start=joint_left_start,
+                joint_left_end=joint_left_end,
+                joint_right_start=joint_right_start,
+                joint_right_end=joint_right_end,
             )
         else:
             self._reader = HamerJsonReader(
