@@ -1,5 +1,16 @@
-from dex_retargeting import RetargetingConfig
+import os
+import sys
 from pathlib import Path
+
+try:
+    from dex_retargeting import RetargetingConfig
+except ModuleNotFoundError:
+    _this_dir = os.path.dirname(os.path.abspath(__file__))
+    _dex_src = os.path.join(_this_dir, "dex-retargeting", "src")
+    if _dex_src not in sys.path:
+        sys.path.append(_dex_src)
+    from dex_retargeting import RetargetingConfig
+
 import yaml
 from enum import Enum
 import logging_mp

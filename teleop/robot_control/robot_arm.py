@@ -185,12 +185,22 @@ class G1_29_ArmController:
         self.subscribe_thread.daemon = True
         self.subscribe_thread.start()
 
+        wait_log_counter = 0
         while not self.lowstate_buffer.GetData():
             time.sleep(0.1)
-            if self.simulation_mode:
-                logger_mp.warning("[G1_29_ArmController] Waiting to read lowstate shared memory...")
-            else:
-                logger_mp.warning("[G1_29_ArmController] Waiting to subscribe dds...")
+            wait_log_counter += 1
+            if wait_log_counter == 1 or wait_log_counter % 50 == 0:
+                waited_s = 0.1 * wait_log_counter
+                if self.simulation_mode:
+                    logger_mp.warning(
+                        "[G1_29_ArmController] Waiting to read lowstate shared memory... (%.1fs)",
+                        waited_s,
+                    )
+                else:
+                    logger_mp.warning(
+                        "[G1_29_ArmController] Waiting to subscribe dds... (%.1fs)",
+                        waited_s,
+                    )
         if self.simulation_mode:
             logger_mp.info("[G1_29_ArmController] Shared memory lowstate ready.")
         else:
@@ -616,12 +626,22 @@ class G1_23_ArmController:
         self.subscribe_thread.daemon = True
         self.subscribe_thread.start()
 
+        wait_log_counter = 0
         while not self.lowstate_buffer.GetData():
             time.sleep(0.1)
-            if self.simulation_mode:
-                logger_mp.warning("[G1_23_ArmController] Waiting to read lowstate shared memory...")
-            else:
-                logger_mp.warning("[G1_23_ArmController] Waiting to subscribe dds...")
+            wait_log_counter += 1
+            if wait_log_counter == 1 or wait_log_counter % 50 == 0:
+                waited_s = 0.1 * wait_log_counter
+                if self.simulation_mode:
+                    logger_mp.warning(
+                        "[G1_23_ArmController] Waiting to read lowstate shared memory... (%.1fs)",
+                        waited_s,
+                    )
+                else:
+                    logger_mp.warning(
+                        "[G1_23_ArmController] Waiting to subscribe dds... (%.1fs)",
+                        waited_s,
+                    )
         if self.simulation_mode:
             logger_mp.info("[G1_23_ArmController] Shared memory lowstate ready.")
         else:
@@ -952,12 +972,22 @@ class H1_2_ArmController:
         self.subscribe_thread.daemon = True
         self.subscribe_thread.start()
 
+        wait_log_counter = 0
         while not self.lowstate_buffer.GetData():
             time.sleep(0.1)
-            if self.simulation_mode:
-                logger_mp.warning("[H1_2_ArmController] Waiting to read lowstate shared memory...")
-            else:
-                logger_mp.warning("[H1_2_ArmController] Waiting to subscribe dds...")
+            wait_log_counter += 1
+            if wait_log_counter == 1 or wait_log_counter % 50 == 0:
+                waited_s = 0.1 * wait_log_counter
+                if self.simulation_mode:
+                    logger_mp.warning(
+                        "[H1_2_ArmController] Waiting to read lowstate shared memory... (%.1fs)",
+                        waited_s,
+                    )
+                else:
+                    logger_mp.warning(
+                        "[H1_2_ArmController] Waiting to subscribe dds... (%.1fs)",
+                        waited_s,
+                    )
         if self.simulation_mode:
             logger_mp.info("[H1_2_ArmController] Shared memory lowstate ready.")
         else:
