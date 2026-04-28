@@ -48,6 +48,43 @@ def _is_pressed(pressed_keys, *aliases: str) -> bool:
     return False
 
 
+def _keyboard_delta_world(actual_tf: np.ndarray, pressed, step: float, move_frame: str = "hybrid") -> np.ndarray:
+    """
+    move_frame:
+      - "hybrid": W/A/S/D follow EE local x/y; Up/Down follow world z (recommended)
+      - "local": all movement follows EE local frame
+      - "world": all movement follows world frame
+    """
+    cmd = np.zeros(3, dtype=np.float64)
+
+    if _is_pressed(pressed, "w"):
+        cmd[0] += step
+    if _is_pressed(pressed, "s"):
+        cmd[0] -= step
+    if _is_pressed(pressed, "a"):
+        cmd[1] += step
+    if _is_pressed(pressed, "d"):
+        cmd[1] -= step
+    if _is_pressed(pressed, "up", "arrow_up", "↑", "8"):
+        cmd[2] += step
+    if _is_pressed(pressed, "down", "arrow_down", "↓", "2"):
+        cmd[2] -= step
+
+    if not np.any(cmd):
+        return np.zeros(3, dtype=np.float64)
+
+    R = actual_tf[:3, :3]
+    if move_frame == "local":
+        return R @ cmd
+    if move_frame == "world":
+        return cmd
+
+    # hybrid: x/y follow EE local frame; z stays world-vertical.
+    dp = R @ np.array([cmd[0], cmd[1], 0.0], dtype=np.float64)
+    dp[2] += cmd[2]
+    return dp
+
+
 def _rot_to_rpy_deg(R: np.ndarray) -> np.ndarray:
     R = np.asarray(R, dtype=np.float64).reshape(3, 3)
     sy = np.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
@@ -191,6 +228,13 @@ def build_arg_parser():
     )
     parser.add_argument("--frequency", type=float, default=30.0, help="Main control loop frequency (Hz)")
     parser.add_argument("--pos-step", type=float, default=0.005, help="Relative translation per tick (m)")
+    parser.add_argument(
+        "--move-frame",
+        type=str,
+        choices=["hybrid", "local", "world"],
+        default="hybrid",
+        help="hybrid: local x/y + world z; local: all local; world: all world",
+    )
     parser.add_argument("--print-period", type=float, default=0.25, help="Status print period (s)")
     parser.add_argument("--sim", action="store_true", help="Use simulation mode (shared memory)")
     parser.add_argument("--real", action="store_true", help="Force real robot mode (DDS)")
@@ -262,7 +306,11 @@ def main(argv=None):
 
         logger_mp.info("-------------------------------------------------------------")
         logger_mp.info("Keyboard relative EE teleop started.")
-        logger_mp.info("Move: W/S(+/-EE X), A/D(+/-EE Y), Up/Down or 8/2(+/-EE Z)")
+        logger_mp.info(
+            "Move frame=%s | W/S(+/-X), A/D(+/-Y), Up/Down or 8/2(+/-Z)",
+            args.move_frame,
+        )
+        logger_mp.info("hybrid means XY in EE local frame, Z in world frame.")
         logger_mp.info("Arm select: L=left arm, R=right arm (one arm at a time)")
         logger_mp.info("Gripper: Q=open, E=close (selected arm)")
         logger_mp.info("Exit: X")
@@ -290,34 +338,41 @@ def main(argv=None):
             current_dq = arm_ctrl.get_current_dual_arm_dq()
             left_actual_tf, right_actual_tf = _fk_dual_ee_tf(arm_ik, current_q)
 
-            local_dp = np.zeros(3, dtype=np.float64)
-            if _is_pressed(pressed, "w"):
-                local_dp[0] += args.pos_step
-            if _is_pressed(pressed, "s"):
-                local_dp[0] -= args.pos_step
-            if _is_pressed(pressed, "a"):
-                local_dp[1] += args.pos_step
-            if _is_pressed(pressed, "d"):
-                local_dp[1] -= args.pos_step
-            if _is_pressed(pressed, "up", "arrow_up", "↑", "8"):
-                local_dp[2] += args.pos_step
-            if _is_pressed(pressed, "down", "arrow_down", "↓", "2"):
-                local_dp[2] -= args.pos_step
-
             if selected_arm == "left":
-                # Use selected EE local frame to get "guided" movement feel.
-                left_target_tf[:3, 3] += left_actual_tf[:3, :3] @ local_dp
-                right_target_tf = right_actual_tf.copy()
-            else:
-                right_target_tf[:3, 3] += right_actual_tf[:3, :3] @ local_dp
+                dp_world = _keyboard_delta_world(
+                    left_actual_tf,
+                    pressed,
+                    float(args.pos_step),
+                    args.move_frame,
+                )
+                # Always build a small target step from current actual pose.
+                # This prevents target accumulation when IK cannot track instantly.
                 left_target_tf = left_actual_tf.copy()
+                left_target_tf[:3, 3] += dp_world
+                right_target_tf = right_actual_tf.copy()
+                moved = bool(np.any(dp_world))
+            else:
+                dp_world = _keyboard_delta_world(
+                    right_actual_tf,
+                    pressed,
+                    float(args.pos_step),
+                    args.move_frame,
+                )
+                right_target_tf = right_actual_tf.copy()
+                right_target_tf[:3, 3] += dp_world
+                left_target_tf = left_actual_tf.copy()
+                moved = bool(np.any(dp_world))
 
-            left_target_tf[0, 3] = np.clip(left_target_tf[0, 3], args.workspace_limit_x[0], args.workspace_limit_x[1])
-            left_target_tf[1, 3] = np.clip(left_target_tf[1, 3], args.workspace_limit_y[0], args.workspace_limit_y[1])
-            left_target_tf[2, 3] = np.clip(left_target_tf[2, 3], args.workspace_limit_z[0], args.workspace_limit_z[1])
-            right_target_tf[0, 3] = np.clip(right_target_tf[0, 3], args.workspace_limit_x[0], args.workspace_limit_x[1])
-            right_target_tf[1, 3] = np.clip(right_target_tf[1, 3], args.workspace_limit_y[0], args.workspace_limit_y[1])
-            right_target_tf[2, 3] = np.clip(right_target_tf[2, 3], args.workspace_limit_z[0], args.workspace_limit_z[1])
+            # Apply workspace clipping only for actively moved arm.
+            # This avoids idle "dragging" when current pose starts outside limits.
+            if moved and selected_arm == "left":
+                left_target_tf[0, 3] = np.clip(left_target_tf[0, 3], args.workspace_limit_x[0], args.workspace_limit_x[1])
+                left_target_tf[1, 3] = np.clip(left_target_tf[1, 3], args.workspace_limit_y[0], args.workspace_limit_y[1])
+                left_target_tf[2, 3] = np.clip(left_target_tf[2, 3], args.workspace_limit_z[0], args.workspace_limit_z[1])
+            elif moved and selected_arm == "right":
+                right_target_tf[0, 3] = np.clip(right_target_tf[0, 3], args.workspace_limit_x[0], args.workspace_limit_x[1])
+                right_target_tf[1, 3] = np.clip(right_target_tf[1, 3], args.workspace_limit_y[0], args.workspace_limit_y[1])
+                right_target_tf[2, 3] = np.clip(right_target_tf[2, 3], args.workspace_limit_z[0], args.workspace_limit_z[1])
 
             if gripper_ctrl is not None:
                 open_hold = ("q" in pressed) and ("e" not in pressed)
