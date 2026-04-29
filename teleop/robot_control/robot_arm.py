@@ -66,7 +66,23 @@ OMNIPICKER_G1_29_ARM_JOINT_NAMES = [
     "idx66_arm_r_joint6",
     "idx67_arm_r_joint7",
 ]
- 
+
+A2D_OMNIPICKER_G1_29_ARM_JOINT_NAMES = [
+    "Joint1_l",
+    "Joint2_l",
+    "Joint3_l",
+    "Joint4_l",
+    "Joint5_l",
+    "Joint6_l",
+    "Joint7_l",
+    "Joint1_r",
+    "Joint2_r",
+    "Joint3_r",
+    "Joint4_r",
+    "Joint5_r",
+    "Joint6_r",
+    "Joint7_r",
+]
 
 class MotorState:
     def __init__(self):
@@ -333,6 +349,16 @@ class G1_29_ArmController:
         names = [str(n) for n in (joint_names or [])]
         name_set = set(names)
         arm_slots = [int(m.value) for m in G1_29_JointArmIndex]
+        if all(n in name_set for n in A2D_OMNIPICKER_G1_29_ARM_JOINT_NAMES):
+            mapping = {
+                joint_name: arm_slots[idx]
+                for idx, joint_name in enumerate(A2D_OMNIPICKER_G1_29_ARM_JOINT_NAMES)
+            }
+            self._sim_joint_mapping_name = "a2d-urdf-named"
+            logger_mp.info(
+                "[G1_29_ArmController] simulation state uses A2D URDF arm joint names."
+            )
+            return mapping
         if all(n in name_set for n in OMNIPICKER_G1_29_ARM_JOINT_NAMES):
             mapping = {
                 joint_name: arm_slots[idx]
@@ -499,15 +525,22 @@ class G1_29_ArmController:
             self.msg.crc = self.crc.Crc(self.msg)
             if self.simulation_mode and self.lowcmd_shm is not None:
                 num_cmd_motors = len(self.msg.motor_cmd)
+                positions = [float(self.msg.motor_cmd[i].q) for i in range(num_cmd_motors)]
+                velocities = [float(self.msg.motor_cmd[i].dq) for i in range(num_cmd_motors)]
+                torques = [float(self.msg.motor_cmd[i].tau) for i in range(num_cmd_motors)]
+                kp = [float(self.msg.motor_cmd[i].kp) for i in range(num_cmd_motors)]
+                kd = [float(self.msg.motor_cmd[i].kd) for i in range(num_cmd_motors)]
                 cmd_data = {
                     "mode_pr": int(self.msg.mode_pr),
                     "mode_machine": int(self.msg.mode_machine),
+                    # Keep a top-level alias for consumers that read direct positions.
+                    "positions": positions,
                     "motor_cmd": {
-                        "positions": [float(self.msg.motor_cmd[i].q) for i in range(num_cmd_motors)],
-                        "velocities": [float(self.msg.motor_cmd[i].dq) for i in range(num_cmd_motors)],
-                        "torques": [float(self.msg.motor_cmd[i].tau) for i in range(num_cmd_motors)],
-                        "kp": [float(self.msg.motor_cmd[i].kp) for i in range(num_cmd_motors)],
-                        "kd": [float(self.msg.motor_cmd[i].kd) for i in range(num_cmd_motors)],
+                        "positions": positions,
+                        "velocities": velocities,
+                        "torques": torques,
+                        "kp": kp,
+                        "kd": kd,
                     },
                 }
                 self.lowcmd_shm.write_data(cmd_data)

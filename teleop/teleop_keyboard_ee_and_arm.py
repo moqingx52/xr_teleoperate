@@ -290,6 +290,8 @@ def main(argv=None):
 
         q_now = arm_ctrl.get_current_dual_arm_q()
         left_target_tf, right_target_tf = _fk_dual_ee_tf(arm_ik, q_now)
+        hold_q = q_now.copy()
+        hold_tauff = np.zeros_like(hold_q, dtype=np.float64)
 
         keyboard_state = KeyboardState()
         kb_listener = threading.Thread(
@@ -392,7 +394,17 @@ def main(argv=None):
                         with right_gripper_value.get_lock():
                             right_gripper_value.value = close_input
 
-            sol_q, sol_tauff = arm_ik.solve_ik(left_target_tf, right_target_tf, current_q, current_dq)
+            if moved:
+                sol_q, sol_tauff = arm_ik.solve_ik(
+                    left_target_tf, right_target_tf, current_q, current_dq
+                )
+                hold_q = np.asarray(sol_q, dtype=np.float64).copy()
+                hold_tauff = np.asarray(sol_tauff, dtype=np.float64).copy()
+            else:
+                # Keep the last solved joint target when idle to avoid spontaneous
+                # IK re-optimization drift before keyboard input.
+                sol_q = hold_q
+                sol_tauff = hold_tauff
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
 
             now = time.time()
