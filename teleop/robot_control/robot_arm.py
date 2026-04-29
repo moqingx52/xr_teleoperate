@@ -112,6 +112,86 @@ def _safe_float(value, default=0.0):
         return float(default)
 
 
+def _as_list_maybe(value):
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return None
+
+
+def _extract_sim_joint_state(msg):
+    """Best-effort parser for sim shm payloads with different field conventions."""
+    if not isinstance(msg, dict):
+        return None, None, None
+
+    candidates = [msg]
+    for key in ("robot_state", "state", "lowstate", "data", "payload"):
+        nested = msg.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+
+    q_keys = ("joint_positions", "positions", "joint_pos", "joint_position", "q")
+    dq_keys = ("joint_velocities", "velocities", "joint_vel", "joint_velocity", "dq")
+    name_keys = ("joint_names", "names")
+
+    def _extract_from_motor_state(payload_dict):
+        for key in ("motor_state", "motor_states", "motorState", "state"):
+            seq = payload_dict.get(key)
+            if not isinstance(seq, list) or len(seq) == 0:
+                continue
+            q_out = []
+            dq_out = []
+            found_any = False
+            for item in seq:
+                if isinstance(item, dict):
+                    q_val = item.get("q", item.get("position", item.get("pos")))
+                    dq_val = item.get("dq", item.get("velocity", item.get("vel")))
+                else:
+                    q_val = getattr(item, "q", None)
+                    dq_val = getattr(item, "dq", None)
+                q_out.append(q_val)
+                dq_out.append(dq_val)
+                if q_val is not None:
+                    found_any = True
+            if found_any:
+                return q_out, dq_out
+        return None, None
+
+    for payload in candidates:
+        q = None
+        dq = None
+        joint_names = None
+
+        for key in q_keys:
+            q = _as_list_maybe(payload.get(key))
+            if q is not None:
+                break
+        if q is None:
+            q, dq = _extract_from_motor_state(payload)
+            if q is None:
+                continue
+
+        if dq is None:
+            for key in dq_keys:
+                dq = _as_list_maybe(payload.get(key))
+                if dq is not None:
+                    break
+
+        for key in name_keys:
+            joint_names = _as_list_maybe(payload.get(key))
+            if joint_names is not None:
+                break
+
+        return q, dq, joint_names
+
+    return None, None, None
+
+
 def _sanitize_lowcmd_for_crc(msg, controller_name):
     for idx, cmd in enumerate(msg.motor_cmd):
         for field in ("q", "dq", "tau", "kp", "kd"):
@@ -179,6 +259,8 @@ class G1_29_ArmController:
         self._sim_lowstate_none_count = 0
         self._sim_joint_name_to_slot = None
         self._sim_joint_mapping_name = "index"
+        self._sim_missing_dq_warned = False
+        self._sim_unexpected_payload_warned = False
 
         # initialize subscribe thread
         self.subscribe_thread = threading.Thread(target=self._subscribe_motor_state)
@@ -213,6 +295,8 @@ class G1_29_ArmController:
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
+        self.q_target = self.get_current_dual_arm_q().copy()
+        self.tauff_target = np.zeros_like(self.q_target, dtype=np.float64)
         logger_mp.debug(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.debug(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
         logger_mp.info("Lock all joints except two arms...")
@@ -309,15 +393,30 @@ class G1_29_ArmController:
                         if not self._lowstate_read_hit_logged:
                             print("[G1_29_ArmController] lowstate shm read hit")
                             self._lowstate_read_hit_logged = True
-                        q = msg.get("joint_positions")
-                        dq = msg.get("joint_velocities")
-                        if q is None or dq is None:
+                        q, dq, joint_names = _extract_sim_joint_state(msg)
+                        if q is None:
+                            if (not self._sim_unexpected_payload_warned) and isinstance(msg, dict):
+                                print(
+                                    "[G1_29_ArmController] simulation state unexpected keys:",
+                                    sorted(list(msg.keys()))[:16],
+                                )
+                                logger_mp.warning(
+                                    "[G1_29_ArmController] simulation state payload has no joint position field, keys=%s",
+                                    sorted(list(msg.keys()))[:16],
+                                )
+                                self._sim_unexpected_payload_warned = True
                             time.sleep(0.002)
                             continue
-                        joint_names = msg.get("joint_names")
+                        if dq is None:
+                            if not self._sim_missing_dq_warned:
+                                logger_mp.warning(
+                                    "[G1_29_ArmController] simulation state missing velocity field; fallback to previous/zero dq."
+                                )
+                                self._sim_missing_dq_warned = True
+                            dq = []
                         lowstate = G1_29_LowState()
-                        q_safe = list(q) if q is not None else []
-                        dq_safe = list(dq) if dq is not None else []
+                        q_safe = list(q)
+                        dq_safe = list(dq)
                         used_named_mapping = self._update_sim_state_from_named_joints(
                             q_safe, dq_safe, joint_names
                         )
@@ -620,6 +719,8 @@ class G1_23_ArmController:
             self.lowstate_subscriber.Init()
         self.lowstate_buffer = DataBuffer()
         self._lowstate_read_hit_logged = False
+        self._sim_missing_dq_warned = False
+        self._sim_unexpected_payload_warned = False
 
         # initialize subscribe thread
         self.subscribe_thread = threading.Thread(target=self._subscribe_motor_state)
@@ -654,6 +755,8 @@ class G1_23_ArmController:
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
+        self.q_target = self.get_current_dual_arm_q().copy()
+        self.tauff_target = np.zeros_like(self.q_target, dtype=np.float64)
         logger_mp.info(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.info(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
         logger_mp.info("Lock all joints except two arms...")
@@ -701,15 +804,35 @@ class G1_23_ArmController:
                 msg = self.lowstate_shm.read_data()
                 if msg is not None:
                     try:
-                        q = msg.get("joint_positions")
-                        dq = msg.get("joint_velocities")
-                        if q is not None and dq is not None:
-                            lowstate = G1_23_LowState()
-                            n = min(G1_23_Num_Motors, len(q), len(dq))
-                            for id in range(n):
-                                lowstate.motor_state[id].q = q[id]
-                                lowstate.motor_state[id].dq = dq[id]
-                            self.lowstate_buffer.SetData(lowstate)
+                        q, dq, _ = _extract_sim_joint_state(msg)
+                        if q is None:
+                            if (not self._sim_unexpected_payload_warned) and isinstance(msg, dict):
+                                print(
+                                    "[G1_23_ArmController] simulation state unexpected keys:",
+                                    sorted(list(msg.keys()))[:16],
+                                )
+                                logger_mp.warning(
+                                    "[G1_23_ArmController] simulation state payload has no joint position field, keys=%s",
+                                    sorted(list(msg.keys()))[:16],
+                                )
+                                self._sim_unexpected_payload_warned = True
+                            time.sleep(0.002)
+                            continue
+                        if dq is None:
+                            if not self._sim_missing_dq_warned:
+                                logger_mp.warning(
+                                    "[G1_23_ArmController] simulation state missing velocity field; fallback to zero dq."
+                                )
+                                self._sim_missing_dq_warned = True
+                            dq = []
+                        lowstate = G1_23_LowState()
+                        n_q = min(G1_23_Num_Motors, len(q))
+                        n_dq = min(G1_23_Num_Motors, len(dq))
+                        for id in range(n_q):
+                            lowstate.motor_state[id].q = q[id]
+                        for id in range(n_dq):
+                            lowstate.motor_state[id].dq = dq[id]
+                        self.lowstate_buffer.SetData(lowstate)
                     except Exception as e:
                         print(f"[G1_23_ArmController] lowstate shm parse failed: {e!r}")
                 time.sleep(0.002)
@@ -966,6 +1089,8 @@ class H1_2_ArmController:
             self.lowstate_subscriber.Init()
         self.lowstate_buffer = DataBuffer()
         self._lowstate_read_hit_logged = False
+        self._sim_missing_dq_warned = False
+        self._sim_unexpected_payload_warned = False
 
         # initialize subscribe thread
         self.subscribe_thread = threading.Thread(target=self._subscribe_motor_state)
@@ -1000,6 +1125,8 @@ class H1_2_ArmController:
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
+        self.q_target = self.get_current_dual_arm_q().copy()
+        self.tauff_target = np.zeros_like(self.q_target, dtype=np.float64)
         logger_mp.info(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.info(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
         logger_mp.info("Lock all joints except two arms...")
@@ -1047,15 +1174,35 @@ class H1_2_ArmController:
                 msg = self.lowstate_shm.read_data()
                 if msg is not None:
                     try:
-                        q = msg.get("joint_positions")
-                        dq = msg.get("joint_velocities")
-                        if q is not None and dq is not None:
-                            lowstate = H1_2_LowState()
-                            n = min(H1_2_Num_Motors, len(q), len(dq))
-                            for id in range(n):
-                                lowstate.motor_state[id].q = q[id]
-                                lowstate.motor_state[id].dq = dq[id]
-                            self.lowstate_buffer.SetData(lowstate)
+                        q, dq, _ = _extract_sim_joint_state(msg)
+                        if q is None:
+                            if (not self._sim_unexpected_payload_warned) and isinstance(msg, dict):
+                                print(
+                                    "[H1_2_ArmController] simulation state unexpected keys:",
+                                    sorted(list(msg.keys()))[:16],
+                                )
+                                logger_mp.warning(
+                                    "[H1_2_ArmController] simulation state payload has no joint position field, keys=%s",
+                                    sorted(list(msg.keys()))[:16],
+                                )
+                                self._sim_unexpected_payload_warned = True
+                            time.sleep(0.002)
+                            continue
+                        if dq is None:
+                            if not self._sim_missing_dq_warned:
+                                logger_mp.warning(
+                                    "[H1_2_ArmController] simulation state missing velocity field; fallback to zero dq."
+                                )
+                                self._sim_missing_dq_warned = True
+                            dq = []
+                        lowstate = H1_2_LowState()
+                        n_q = min(H1_2_Num_Motors, len(q))
+                        n_dq = min(H1_2_Num_Motors, len(dq))
+                        for id in range(n_q):
+                            lowstate.motor_state[id].q = q[id]
+                        for id in range(n_dq):
+                            lowstate.motor_state[id].dq = dq[id]
+                        self.lowstate_buffer.SetData(lowstate)
                     except Exception as e:
                         print(f"[H1_2_ArmController] lowstate shm parse failed: {e!r}")
                 time.sleep(0.002)
@@ -1323,6 +1470,8 @@ class H1_ArmController:
         self.msg.gpio = 0
 
         self.all_motor_q = self.get_current_motor_q()
+        self.q_target = self.get_current_dual_arm_q().copy()
+        self.tauff_target = np.zeros_like(self.q_target, dtype=np.float64)
         logger_mp.info(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.info(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
         logger_mp.info("Lock all joints except two arms...")
