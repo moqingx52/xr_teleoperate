@@ -48,7 +48,7 @@ def _is_pressed(pressed_keys, *aliases: str) -> bool:
     return False
 
 
-def _keyboard_delta_world(actual_tf: np.ndarray, pressed, step: float, move_frame: str = "hybrid") -> np.ndarray:
+def _keyboard_delta_world(ee_tf: np.ndarray, pressed, step: float, move_frame: str = "hybrid") -> np.ndarray:
     """
     move_frame:
       - "hybrid": W/A/S/D follow EE local x/y; Up/Down follow world z (recommended)
@@ -73,7 +73,7 @@ def _keyboard_delta_world(actual_tf: np.ndarray, pressed, step: float, move_fram
     if not np.any(cmd):
         return np.zeros(3, dtype=np.float64)
 
-    R = actual_tf[:3, :3]
+    R = ee_tf[:3, :3]
     if move_frame == "local":
         return R @ cmd
     if move_frame == "world":
@@ -83,6 +83,47 @@ def _keyboard_delta_world(actual_tf: np.ndarray, pressed, step: float, move_fram
     dp = R @ np.array([cmd[0], cmd[1], 0.0], dtype=np.float64)
     dp[2] += cmd[2]
     return dp
+
+
+def _keyboard_pitch_delta(pressed, step_rad: float) -> float:
+    delta = 0.0
+    if _is_pressed(pressed, "left", "arrow_left", "←", "4"):
+        delta += step_rad
+    if _is_pressed(pressed, "right", "arrow_right", "→", "6"):
+        delta -= step_rad
+    return float(delta)
+
+
+def _rot_y(theta: float) -> np.ndarray:
+    c = np.cos(theta)
+    s = np.sin(theta)
+    return np.array(
+        [
+            [c, 0.0, s],
+            [0.0, 1.0, 0.0],
+            [-s, 0.0, c],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _rpy_deg_to_rot(rpy_deg: np.ndarray) -> np.ndarray:
+    roll, pitch, yaw = np.deg2rad(np.asarray(rpy_deg, dtype=np.float64).reshape(3))
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float64)
+    ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float64)
+    rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return rz @ ry @ rx
+
+
+def _pose_vec_to_tf(pose: np.ndarray) -> np.ndarray:
+    pose = np.asarray(pose, dtype=np.float64).reshape(6)
+    tf = np.eye(4, dtype=np.float64)
+    tf[:3, 3] = pose[:3]
+    tf[:3, :3] = _rpy_deg_to_rot(pose[3:])
+    return tf
 
 
 def _rot_to_rpy_deg(R: np.ndarray) -> np.ndarray:
@@ -217,7 +258,7 @@ def _build_gripper_controller(args):
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="Keyboard relative EE teleop: WASD + Up/Down move, Q/E gripper, L/R switch arm."
+        description="Keyboard direct EE-pose teleop: WASD + Up/Down move, Left/Right pitch, Q/E gripper."
     )
     parser.add_argument("--arm", type=str, choices=["G1_29", "G1_23", "H1_2", "H1"], default="G1_29")
     parser.add_argument(
@@ -228,6 +269,23 @@ def build_arg_parser():
     )
     parser.add_argument("--frequency", type=float, default=30.0, help="Main control loop frequency (Hz)")
     parser.add_argument("--pos-step", type=float, default=0.005, help="Relative translation per tick (m)")
+    parser.add_argument("--pitch-step-deg", type=float, default=1.0, help="Gripper pitch step per tick (deg)")
+    parser.add_argument(
+        "--left-ee-pose",
+        type=float,
+        nargs=6,
+        default=None,
+        metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
+        help="Initial left EE target pose. xyz in meters, rpy in degrees. Defaults to current FK.",
+    )
+    parser.add_argument(
+        "--right-ee-pose",
+        type=float,
+        nargs=6,
+        default=None,
+        metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
+        help="Initial right EE target pose. xyz in meters, rpy in degrees. Defaults to current FK.",
+    )
     parser.add_argument(
         "--move-frame",
         type=str,
@@ -289,9 +347,12 @@ def main(argv=None):
         ) = _build_gripper_controller(args)
 
         q_now = arm_ctrl.get_current_dual_arm_q()
-        left_target_tf, right_target_tf = _fk_dual_ee_tf(arm_ik, q_now)
+        left_actual_tf, right_actual_tf = _fk_dual_ee_tf(arm_ik, q_now)
+        left_target_tf = _pose_vec_to_tf(args.left_ee_pose) if args.left_ee_pose is not None else left_actual_tf.copy()
+        right_target_tf = _pose_vec_to_tf(args.right_ee_pose) if args.right_ee_pose is not None else right_actual_tf.copy()
         hold_q = q_now.copy()
         hold_tauff = np.zeros_like(hold_q, dtype=np.float64)
+        target_dirty = args.left_ee_pose is not None or args.right_ee_pose is not None
 
         keyboard_state = KeyboardState()
         kb_listener = threading.Thread(
@@ -307,11 +368,12 @@ def main(argv=None):
         kb_listener.start()
 
         logger_mp.info("-------------------------------------------------------------")
-        logger_mp.info("Keyboard relative EE teleop started.")
+        logger_mp.info("Keyboard direct EE-pose teleop started.")
         logger_mp.info(
             "Move frame=%s | W/S(+/-X), A/D(+/-Y), Up/Down or 8/2(+/-Z)",
             args.move_frame,
         )
+        logger_mp.info("Pitch: Left/Right arrows or 4/6 rotate selected gripper around local Y.")
         logger_mp.info("hybrid means XY in EE local frame, Z in world frame.")
         logger_mp.info("Arm select: L=left arm, R=right arm (one arm at a time)")
         logger_mp.info("Gripper: Q=open, E=close (selected arm)")
@@ -340,38 +402,40 @@ def main(argv=None):
             current_dq = arm_ctrl.get_current_dual_arm_dq()
             left_actual_tf, right_actual_tf = _fk_dual_ee_tf(arm_ik, current_q)
 
+            pitch_delta = _keyboard_pitch_delta(pressed, np.deg2rad(float(args.pitch_step_deg)))
+
             if selected_arm == "left":
                 dp_world = _keyboard_delta_world(
-                    left_actual_tf,
+                    left_target_tf,
                     pressed,
                     float(args.pos_step),
                     args.move_frame,
                 )
-                # Always build a small target step from current actual pose.
-                # This prevents target accumulation when IK cannot track instantly.
-                left_target_tf = left_actual_tf.copy()
                 left_target_tf[:3, 3] += dp_world
-                right_target_tf = right_actual_tf.copy()
-                moved = bool(np.any(dp_world))
+                if pitch_delta:
+                    left_target_tf[:3, :3] = left_target_tf[:3, :3] @ _rot_y(pitch_delta)
+                pose_changed = bool(np.any(dp_world)) or bool(pitch_delta)
             else:
                 dp_world = _keyboard_delta_world(
-                    right_actual_tf,
+                    right_target_tf,
                     pressed,
                     float(args.pos_step),
                     args.move_frame,
                 )
-                right_target_tf = right_actual_tf.copy()
                 right_target_tf[:3, 3] += dp_world
-                left_target_tf = left_actual_tf.copy()
-                moved = bool(np.any(dp_world))
+                if pitch_delta:
+                    right_target_tf[:3, :3] = right_target_tf[:3, :3] @ _rot_y(pitch_delta)
+                pose_changed = bool(np.any(dp_world)) or bool(pitch_delta)
 
-            # Apply workspace clipping only for actively moved arm.
-            # This avoids idle "dragging" when current pose starts outside limits.
-            if moved and selected_arm == "left":
+            if pose_changed:
+                target_dirty = True
+
+            # Apply workspace clipping only for actively changed arm.
+            if pose_changed and selected_arm == "left":
                 left_target_tf[0, 3] = np.clip(left_target_tf[0, 3], args.workspace_limit_x[0], args.workspace_limit_x[1])
                 left_target_tf[1, 3] = np.clip(left_target_tf[1, 3], args.workspace_limit_y[0], args.workspace_limit_y[1])
                 left_target_tf[2, 3] = np.clip(left_target_tf[2, 3], args.workspace_limit_z[0], args.workspace_limit_z[1])
-            elif moved and selected_arm == "right":
+            elif pose_changed and selected_arm == "right":
                 right_target_tf[0, 3] = np.clip(right_target_tf[0, 3], args.workspace_limit_x[0], args.workspace_limit_x[1])
                 right_target_tf[1, 3] = np.clip(right_target_tf[1, 3], args.workspace_limit_y[0], args.workspace_limit_y[1])
                 right_target_tf[2, 3] = np.clip(right_target_tf[2, 3], args.workspace_limit_z[0], args.workspace_limit_z[1])
@@ -394,15 +458,14 @@ def main(argv=None):
                         with right_gripper_value.get_lock():
                             right_gripper_value.value = close_input
 
-            if moved:
+            if target_dirty:
                 sol_q, sol_tauff = arm_ik.solve_ik(
                     left_target_tf, right_target_tf, current_q, current_dq
                 )
                 hold_q = np.asarray(sol_q, dtype=np.float64).copy()
                 hold_tauff = np.asarray(sol_tauff, dtype=np.float64).copy()
+                target_dirty = False
             else:
-                # Keep the last solved joint target when idle to avoid spontaneous
-                # IK re-optimization drift before keyboard input.
                 sol_q = hold_q
                 sol_tauff = hold_tauff
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
