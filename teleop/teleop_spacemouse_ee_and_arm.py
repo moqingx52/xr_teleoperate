@@ -5,6 +5,7 @@ Requires read access to the hidraw node (e.g. plugdev group or udev rules).
 Protocol matches read_hidraw_3dmouse.py: rid 1 translation, rid 2 rotation, rid 3 buttons.
 """
 import argparse
+import glob
 import os
 import struct
 import sys
@@ -48,6 +49,87 @@ BTN_2 = 8192
 BTN_3 = 16384
 BTN_4 = 32768
 BTN_MODE = 67108864  # 0x04000000
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _read_kv_file(path: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    txt = _read_text(path)
+    if not txt:
+        return out
+    for line in txt.splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _find_parent_attr(start_dir: str, attr_name: str, max_hops: int = 8) -> str | None:
+    cur = os.path.realpath(start_dir)
+    for _ in range(max_hops):
+        val = _read_text(os.path.join(cur, attr_name))
+        if val:
+            return val
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
+def _discover_spacemouse_hidraw(
+    vid: str = "046d",
+    pid: str = "c62b",
+    name_contains: str = "SpaceMouse",
+) -> str | None:
+    """
+    Find /dev/hidrawN by usb vid/pid (preferred) and fallback product name.
+    """
+    vid = str(vid).lower()
+    pid = str(pid).lower()
+    name_contains_l = str(name_contains).lower()
+    by_name = []
+
+    for hidraw_path in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        node = os.path.basename(hidraw_path)
+        dev_node = f"/dev/{node}"
+        device_dir = os.path.realpath(os.path.join(hidraw_path, "device"))
+
+        # Primary source: HID_ID/HID_NAME from uevent, independent of parent depth.
+        ue = _read_kv_file(os.path.join(device_dir, "uevent"))
+        hid_id = ue.get("HID_ID", "")
+        hid_name = ue.get("HID_NAME", "")
+        if hid_id:
+            parts = hid_id.split(":")
+            if len(parts) == 3:
+                vid_hex = parts[1].lower()
+                pid_hex = parts[2].lower()
+                if vid_hex == vid and pid_hex == pid:
+                    return dev_node
+
+        # Fallback: walk up ancestors and search vendor/product attrs.
+        vid_text = _find_parent_attr(device_dir, "idVendor")
+        pid_text = _find_parent_attr(device_dir, "idProduct")
+        if vid_text and pid_text and vid_text.lower() == vid and pid_text.lower() == pid:
+            return dev_node
+
+        product = hid_name or _find_parent_attr(device_dir, "product") or _read_text(
+            os.path.join(device_dir, "name")
+        )
+        if product and name_contains_l in product.lower():
+            by_name.append(dev_node)
+
+    if by_name:
+        return by_name[0]
+    return None
 
 
 def _rot_x(theta: float) -> np.ndarray:
@@ -374,7 +456,20 @@ def build_arg_parser():
         default="none",
     )
     parser.add_argument("--frequency", type=float, default=30.0, help="Main control loop frequency (Hz)")
-    parser.add_argument("--hidraw-device", type=str, default="/dev/hidraw3", help="hidraw device path")
+    parser.add_argument(
+        "--hidraw-device",
+        type=str,
+        default="auto",
+        help="hidraw device path, or 'auto' to discover SpaceMouse by VID/PID",
+    )
+    parser.add_argument("--hidraw-vid", type=str, default="046d", help="USB vendor id for auto-discovery")
+    parser.add_argument("--hidraw-pid", type=str, default="c62b", help="USB product id for auto-discovery")
+    parser.add_argument(
+        "--hidraw-name-contains",
+        type=str,
+        default="SpaceMouse",
+        help="Fallback product name keyword for auto-discovery",
+    )
     parser.add_argument(
         "--trans-scale",
         type=float,
@@ -470,6 +565,19 @@ def main(argv=None):
         args.sim = True
     if args.ee == "omnipicker":
         args.ee = "inspire_gripper"
+    if str(args.hidraw_device).lower() == "auto":
+        resolved = _discover_spacemouse_hidraw(
+            vid=args.hidraw_vid,
+            pid=args.hidraw_pid,
+            name_contains=args.hidraw_name_contains,
+        )
+        if resolved is None:
+            parser.error(
+                "Cannot auto-discover SpaceMouse hidraw device. "
+                "Pass --hidraw-device /dev/hidrawN explicitly, or adjust "
+                "--hidraw-vid/--hidraw-pid/--hidraw-name-contains."
+            )
+        args.hidraw_device = resolved
 
     if not args.sim:
         ChannelFactoryInitialize(0, networkInterface=args.network_interface)
