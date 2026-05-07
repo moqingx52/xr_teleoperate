@@ -542,7 +542,7 @@ def build_arg_parser():
     parser.add_argument("--network-interface", type=str, default=None)
     parser.add_argument("--workspace-limit-x", type=float, nargs=2, default=[-0.20, 0.80], metavar=("MIN", "MAX"))
     parser.add_argument("--workspace-limit-y", type=float, nargs=2, default=[-0.80, 0.80], metavar=("MIN", "MAX"))
-    parser.add_argument("--workspace-limit-z", type=float, nargs=2, default=[-0.40, 0.80], metavar=("MIN", "MAX"))
+    parser.add_argument("--workspace-limit-z", type=float, nargs=2, default=[-2.0, 2.0], metavar=("MIN", "MAX"))
     parser.add_argument("--gripper-input-min", type=float, default=0.0)
     parser.add_argument("--gripper-input-max", type=float, default=1.0)
     parser.add_argument("--gripper-open-input", type=float, default=1.0)
