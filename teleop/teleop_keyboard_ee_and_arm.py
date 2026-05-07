@@ -48,15 +48,14 @@ def _is_pressed(pressed_keys, *aliases: str) -> bool:
     return False
 
 
-def _keyboard_delta_world(ee_tf: np.ndarray, pressed, step: float, move_frame: str = "hybrid") -> np.ndarray:
+def _keyboard_delta_base(pressed, step: float) -> np.ndarray:
     """
-    move_frame:
-      - "hybrid": W/A/S/D follow EE local x/y; Up/Down follow world z (recommended)
-      - "local": all movement follows EE local frame
-      - "world": all movement follows world frame
+    Keyboard translation command in robot base frame.
+      - W/S: +X/-X (forward/backward)
+      - A/D: +Y/-Y (left/right)
+      - Up/Down: +Z/-Z (up/down)
     """
     cmd = np.zeros(3, dtype=np.float64)
-
     if _is_pressed(pressed, "w"):
         cmd[0] += step
     if _is_pressed(pressed, "s"):
@@ -69,20 +68,7 @@ def _keyboard_delta_world(ee_tf: np.ndarray, pressed, step: float, move_frame: s
         cmd[2] += step
     if _is_pressed(pressed, "down", "arrow_down", "↓", "2"):
         cmd[2] -= step
-
-    if not np.any(cmd):
-        return np.zeros(3, dtype=np.float64)
-
-    R = ee_tf[:3, :3]
-    if move_frame == "local":
-        return R @ cmd
-    if move_frame == "world":
-        return cmd
-
-    # hybrid: x/y follow EE local frame; z stays world-vertical.
-    dp = R @ np.array([cmd[0], cmd[1], 0.0], dtype=np.float64)
-    dp[2] += cmd[2]
-    return dp
+    return cmd
 
 
 def _keyboard_pitch_delta(pressed, step_rad: float) -> float:
@@ -92,6 +78,19 @@ def _keyboard_pitch_delta(pressed, step_rad: float) -> float:
     if _is_pressed(pressed, "right", "arrow_right", "→", "6"):
         delta -= step_rad
     return float(delta)
+
+
+def _rot_x(theta: float) -> np.ndarray:
+    c = np.cos(theta)
+    s = np.sin(theta)
+    return np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, c, -s],
+            [0.0, s, c],
+        ],
+        dtype=np.float64,
+    )
 
 
 def _rot_y(theta: float) -> np.ndarray:
@@ -105,6 +104,47 @@ def _rot_y(theta: float) -> np.ndarray:
         ],
         dtype=np.float64,
     )
+
+
+def _rot_z(theta: float) -> np.ndarray:
+    c = np.cos(theta)
+    s = np.sin(theta)
+    return np.array(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _apply_keyboard_delta(
+    target_tf: np.ndarray,
+    dp_base: np.ndarray | None = None,
+    dR_local: np.ndarray | None = None,
+    dR_base: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Apply keyboard pose increment to base_T_ee.
+
+    - dp_base: translation delta in robot base frame (independent of EE attitude).
+    - dR_local: local-frame rotation increment (post-multiply).
+    - dR_base: base-frame rotation increment (pre-multiply).
+    """
+    T = np.asarray(target_tf, dtype=np.float64).copy().reshape(4, 4)
+
+    if dp_base is not None:
+        # Critical fix: apply translational delta directly in base coordinates.
+        T[:3, 3] += np.asarray(dp_base, dtype=np.float64).reshape(3)
+
+    if dR_local is not None:
+        T[:3, :3] = T[:3, :3] @ np.asarray(dR_local, dtype=np.float64).reshape(3, 3)
+
+    if dR_base is not None:
+        T[:3, :3] = np.asarray(dR_base, dtype=np.float64).reshape(3, 3) @ T[:3, :3]
+
+    return T
 
 
 def _rpy_deg_to_rot(rpy_deg: np.ndarray) -> np.ndarray:
@@ -258,7 +298,7 @@ def _build_gripper_controller(args):
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="Keyboard direct EE-pose teleop: WASD + Up/Down move, Left/Right pitch, Q/E gripper."
+        description="Keyboard direct EE-pose teleop: base-frame translation, EE rotation, Q/E gripper."
     )
     parser.add_argument("--arm", type=str, choices=["G1_29", "G1_23", "H1_2", "H1"], default="G1_29")
     parser.add_argument(
@@ -268,8 +308,8 @@ def build_arg_parser():
         default="omnipicker",
     )
     parser.add_argument("--frequency", type=float, default=30.0, help="Main control loop frequency (Hz)")
-    parser.add_argument("--pos-step", type=float, default=0.005, help="Relative translation per tick (m)")
-    parser.add_argument("--pitch-step-deg", type=float, default=1.0, help="Gripper pitch step per tick (deg)")
+    parser.add_argument("--pos-step", type=float, default=0.005, help="Base-frame translation per tick (m)")
+    parser.add_argument("--pitch-step-deg", type=float, default=1.0, help="Gripper local-Y rotation step per tick (deg)")
     parser.add_argument(
         "--left-ee-pose",
         type=float,
@@ -290,8 +330,8 @@ def build_arg_parser():
         "--move-frame",
         type=str,
         choices=["hybrid", "local", "world"],
-        default="hybrid",
-        help="hybrid: local x/y + world z; local: all local; world: all world",
+        default="world",
+        help="Deprecated and ignored. Translation is always interpreted in robot base frame.",
     )
     parser.add_argument("--print-period", type=float, default=0.25, help="Status print period (s)")
     parser.add_argument("--sim", action="store_true", help="Use simulation mode (shared memory)")
@@ -370,11 +410,9 @@ def main(argv=None):
         logger_mp.info("-------------------------------------------------------------")
         logger_mp.info("Keyboard direct EE-pose teleop started.")
         logger_mp.info(
-            "Move frame=%s | W/S(+/-X), A/D(+/-Y), Up/Down or 8/2(+/-Z)",
-            args.move_frame,
+            "Base-frame translation | W/S(+/-X), A/D(+/-Y), Up/Down or 8/2(+/-Z)",
         )
-        logger_mp.info("Pitch: Left/Right arrows or 4/6 rotate selected gripper around local Y.")
-        logger_mp.info("hybrid means XY in EE local frame, Z in world frame.")
+        logger_mp.info("Rotation: Left/Right arrows or 4/6 rotate selected gripper around local Y.")
         logger_mp.info("Arm select: L=left arm, R=right arm (one arm at a time)")
         logger_mp.info("Gripper: Q=open, E=close (selected arm)")
         logger_mp.info("Exit: X")
@@ -404,28 +442,22 @@ def main(argv=None):
 
             pitch_delta = _keyboard_pitch_delta(pressed, np.deg2rad(float(args.pitch_step_deg)))
 
+            dp_base = _keyboard_delta_base(pressed, float(args.pos_step))
+
             if selected_arm == "left":
-                dp_world = _keyboard_delta_world(
+                left_target_tf = _apply_keyboard_delta(
                     left_target_tf,
-                    pressed,
-                    float(args.pos_step),
-                    args.move_frame,
+                    dp_base=dp_base,
+                    dR_local=_rot_y(pitch_delta) if pitch_delta else None,
                 )
-                left_target_tf[:3, 3] += dp_world
-                if pitch_delta:
-                    left_target_tf[:3, :3] = left_target_tf[:3, :3] @ _rot_y(pitch_delta)
-                pose_changed = bool(np.any(dp_world)) or bool(pitch_delta)
+                pose_changed = bool(np.any(dp_base)) or bool(pitch_delta)
             else:
-                dp_world = _keyboard_delta_world(
+                right_target_tf = _apply_keyboard_delta(
                     right_target_tf,
-                    pressed,
-                    float(args.pos_step),
-                    args.move_frame,
+                    dp_base=dp_base,
+                    dR_local=_rot_y(pitch_delta) if pitch_delta else None,
                 )
-                right_target_tf[:3, 3] += dp_world
-                if pitch_delta:
-                    right_target_tf[:3, :3] = right_target_tf[:3, :3] @ _rot_y(pitch_delta)
-                pose_changed = bool(np.any(dp_world)) or bool(pitch_delta)
+                pose_changed = bool(np.any(dp_base)) or bool(pitch_delta)
 
             if pose_changed:
                 target_dirty = True

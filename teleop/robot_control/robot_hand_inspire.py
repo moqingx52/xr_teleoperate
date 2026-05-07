@@ -1,7 +1,6 @@
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize # dds
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_                           # idl
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
-from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
 from teleop.utils.isaac_shm import (
     SHM_INSPIRE_CMD,
     SHM_INSPIRE_STATE,
@@ -220,6 +219,7 @@ class Inspire_Controller_DFX:
     def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock = None, dual_hand_state_array = None,
                        dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False):
         logger_mp.info("Initialize Inspire_Controller_DFX...")
+        from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
         self.fps = fps
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
@@ -411,6 +411,7 @@ class Inspire_Controller_FTP:
     def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock = None, dual_hand_state_array = None,
                        dual_hand_action_array = None, fps = 100.0, Unit_Test = False, simulation_mode = False):
         logger_mp.info("Initialize Inspire_Controller_FTP...")
+        from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
         inspire_dds = None
         self.inspire_hand_default = None
         if not simulation_mode:
