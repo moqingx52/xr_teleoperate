@@ -344,8 +344,11 @@ def build_arg_parser():
     parser.add_argument("--gripper-input-max", type=float, default=1.0)
     parser.add_argument("--gripper-open-input", type=float, default=1.0)
     parser.add_argument("--gripper-close-input", type=float, default=0.0)
-    parser.add_argument("--inspire-gripper-open", type=float, default=0.05)
-    parser.add_argument("--inspire-gripper-close", type=float, default=0.9)
+    # InspireDDS protocol endpoints (matches InspireDDS.isaac_output_range = (0.0, 1.2))
+    #   open  = 0.0 -> JoySim mirror map drives joints to +-OMNIPICKER_GRIPPER_OPEN_RAD
+    #   close = 1.2 -> JoySim mirror map drives joints to 0 (fingertips meet)
+    parser.add_argument("--inspire-gripper-open", type=float, default=0.0)
+    parser.add_argument("--inspire-gripper-close", type=float, default=1.2)
     parser.add_argument("--inspire-gripper-alpha", type=float, default=0.2)
     parser.add_argument("--inspire-gripper-max-speed", type=float, default=1.5)
     parser.add_argument("--go-home-on-exit", action="store_true", help="Send both arms to home pose when exiting")

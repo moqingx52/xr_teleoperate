@@ -486,7 +486,9 @@ unitree@PC2:~/DFX_inspire_service/build$ ./hand_example
 >     - 左手柄摇杆控制机器人前后左右（最大控制速度已经在程序中进行了限制）
 >     - 右手柄摇杆控制机器人转向（最大控制速度已经在程序中进行了限制）
 
-与仿真部署基本一致，但要注意上述警告事项。
+与仿真部署基本一致，但要注意上述警告事项。 
+
+sudo -E env "PATH=$PATH" "PYTHONPATH=." python teleop/teleop_spacemouse_ee_and_arm.py --sim --ee inspire_gripper --debug-buttons
 
 ## 3.6 🔚 退出
 

@@ -325,7 +325,7 @@ def _spacemouse_dp_base(
     return dp
 
 
-def _spacemouse_dR_local(
+def _spacemouse_dR_base(
     rx: int,
     ry: int,
     rz: int,
@@ -334,17 +334,22 @@ def _spacemouse_dR_local(
     rot_deadzone: float,
 ) -> np.ndarray | None:
     """
-    rz: yaw, rx: pitch, ry: roll — small angles in radians, composed as Rz @ Rx @ Ry on EE.
+    Build a rotation delta expressed in the robot base frame.
+    rx -> pitch (rotation about base Y), ry -> roll (base X), rz -> yaw (base Z).
+    Composed as Rz(yaw) @ Ry(pitch) @ Rx(roll) (small-angle increments) and applied by
+    LEFT-multiplication
+    so that rotation axes are always aligned with the fixed base frame, regardless of
+    the current EE orientation.
     """
     rv = np.array([float(rx), float(ry), float(rz)], dtype=np.float64)
     rv = _deadzone_vec(rv, rot_deadzone)
     if float(np.linalg.norm(rv)) < 1e-12:
         return None
     k = np.asarray(rot_axis_scale, dtype=np.float64).reshape(3)
-    ax = rot_scale * k[0] * rv[0]
-    ay = rot_scale * k[1] * rv[1]
-    az = rot_scale * k[2] * rv[2]
-    return _rot_z(az) @ _rot_x(ax) @ _rot_y(ay)
+    pitch_base_y = rot_scale * k[0] * rv[0]
+    roll_base_x = rot_scale * k[1] * rv[1]
+    yaw_base_z = rot_scale * k[2] * rv[2]
+    return _rot_z(yaw_base_z) @ _rot_y(pitch_base_y) @ _rot_x(roll_base_x)
 
 
 class SpaceMouseHidState:
@@ -446,7 +451,7 @@ def _hid_reader_loop(path: str, state: SpaceMouseHidState, stop_evt: threading.E
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="SpaceMouse hidraw EE teleop: base translation / local rotation modes, buttons for arm and gripper."
+        description="SpaceMouse hidraw EE teleop: base translation / base-frame rotation modes, buttons for arm and gripper."
     )
     parser.add_argument("--arm", type=str, choices=["G1_29", "G1_23", "H1_2", "H1"], default="G1_29")
     parser.add_argument(
@@ -502,7 +507,7 @@ def build_arg_parser():
         nargs=3,
         default=[1.0, 1.0, 1.0],
         metavar=("RX", "RY", "RZ"),
-        help="Per-axis multipliers (rx pitch, ry roll, rz yaw)",
+        help="Per-axis multipliers (rx pitch@base-Y, ry roll@base-X, rz yaw@base-Z)",
     )
     parser.add_argument(
         "--rot-deadzone",
@@ -547,8 +552,11 @@ def build_arg_parser():
     parser.add_argument("--gripper-input-max", type=float, default=1.0)
     parser.add_argument("--gripper-open-input", type=float, default=1.0)
     parser.add_argument("--gripper-close-input", type=float, default=0.0)
-    parser.add_argument("--inspire-gripper-open", type=float, default=0.05)
-    parser.add_argument("--inspire-gripper-close", type=float, default=0.9)
+    # InspireDDS protocol endpoints (matches InspireDDS.isaac_output_range = (0.0, 1.2))
+    #   open  = 0.0 -> JoySim mirror map drives joints to +-OMNIPICKER_GRIPPER_OPEN_RAD
+    #   close = 1.2 -> JoySim mirror map drives joints to 0 (fingertips meet)
+    parser.add_argument("--inspire-gripper-open", type=float, default=0.0)
+    parser.add_argument("--inspire-gripper-close", type=float, default=1.2)
     parser.add_argument("--inspire-gripper-alpha", type=float, default=0.2)
     parser.add_argument("--inspire-gripper-max-speed", type=float, default=1.5)
     parser.add_argument("--go-home-on-exit", action="store_true", help="Send both arms home on exit")
@@ -614,7 +622,7 @@ def main(argv=None):
         hold_tauff = np.zeros_like(hold_q, dtype=np.float64)
         target_dirty = args.left_ee_pose is not None or args.right_ee_pose is not None
 
-        selected_arm = "right"
+        selected_arm = "left"
         control_mode = "position"  # "position" | "orientation"
 
         hid_thread = threading.Thread(
@@ -625,10 +633,13 @@ def main(argv=None):
         hid_thread.start()
 
         logger_mp.info("-------------------------------------------------------------")
-        logger_mp.info("SpaceMouse EE teleop started (default arm: RIGHT).")
+        logger_mp.info("SpaceMouse EE teleop started (default arm: LEFT).")
         logger_mp.info("Device: %s", args.hidraw_device)
         logger_mp.info("Position mode: cap translation -> base XYZ | Mode button toggles orientation mode")
-        logger_mp.info("Orientation mode: rx,ry,rz -> local EE Rz*Rx*Ry small angles")
+        logger_mp.info(
+            "Orientation mode: rx,ry,rz -> base-frame Rz(yaw)*Ry(pitch)*Rx(roll) "
+            "(left-multiply, axes fixed to robot base)"
+        )
         logger_mp.info("Buttons: 1=left arm, 2=right arm | 3=open gripper, 4=close | mode=toggle pos/ori")
         logger_mp.info("Exit: Ctrl+C")
         if gripper_ctrl is not None:
@@ -682,11 +693,11 @@ def main(argv=None):
                 dp_base = _spacemouse_dp_base(
                     tx, ty, tz, float(args.trans_scale), float(args.trans_deadzone), flip
                 )
-                dR_local = None
+                dR_base = None
                 pose_changed = bool(np.any(np.abs(dp_base) > 0))
             else:
                 dp_base = np.zeros(3, dtype=np.float64)
-                dR_local = _spacemouse_dR_local(
+                dR_base = _spacemouse_dR_base(
                     rx,
                     ry,
                     rz,
@@ -694,19 +705,19 @@ def main(argv=None):
                     rot_axis_scale,
                     float(args.rot_deadzone),
                 )
-                pose_changed = dR_local is not None
+                pose_changed = dR_base is not None
 
             if selected_arm == "left":
                 left_target_tf = _apply_keyboard_delta(
                     left_target_tf,
                     dp_base=dp_base if control_mode == "position" else None,
-                    dR_local=dR_local if control_mode == "orientation" else None,
+                    dR_base=dR_base if control_mode == "orientation" else None,
                 )
             else:
                 right_target_tf = _apply_keyboard_delta(
                     right_target_tf,
                     dp_base=dp_base if control_mode == "position" else None,
-                    dR_local=dR_local if control_mode == "orientation" else None,
+                    dR_base=dR_base if control_mode == "orientation" else None,
                 )
 
             if pose_changed:
@@ -722,23 +733,7 @@ def main(argv=None):
                 right_target_tf[2, 3] = np.clip(right_target_tf[2, 3], args.workspace_limit_z[0], args.workspace_limit_z[1])
 
             if gripper_ctrl is not None:
-                open_hold = bool(raw_buttons & BTN_3) and not bool(raw_buttons & BTN_4)
-                close_hold = bool(raw_buttons & BTN_4) and not bool(raw_buttons & BTN_3)
-                if selected_arm == "left":
-                    if open_hold:
-                        with left_gripper_value.get_lock():
-                            left_gripper_value.value = open_input
-                    elif close_hold:
-                        with left_gripper_value.get_lock():
-                            left_gripper_value.value = close_input
-                else:
-                    if open_hold:
-                        with right_gripper_value.get_lock():
-                            right_gripper_value.value = open_input
-                    elif close_hold:
-                        with right_gripper_value.get_lock():
-                            right_gripper_value.value = close_input
-
+                # Latching behavior: button press updates target once and keeps it.
                 if edges & BTN_3:
                     if selected_arm == "left":
                         with left_gripper_value.get_lock():
@@ -747,6 +742,7 @@ def main(argv=None):
                         with right_gripper_value.get_lock():
                             right_gripper_value.value = open_input
                     logger_mp.info("[spacemouse] BTN3 pressed, gripper OPEN (%s)", selected_arm)
+
                 if edges & BTN_4:
                     if selected_arm == "left":
                         with left_gripper_value.get_lock():
