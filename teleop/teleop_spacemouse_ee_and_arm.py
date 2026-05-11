@@ -5,6 +5,7 @@ Requires read access to the hidraw node (e.g. plugdev group or udev rules).
 Protocol matches read_hidraw_3dmouse.py: rid 1 translation, rid 2 rotation, rid 3 buttons.
 """
 import argparse
+import bisect
 import glob
 import os
 import struct
@@ -43,12 +44,192 @@ except RuntimeError as exc:
         raise
 logger_mp = logging_mp.getLogger(__name__)
 
+DEFAULT_RECORD_DIR = "/home/gsy/work/fastsim/record"
+
 # Button masks from SpaceMouse / output.md examples
 BTN_1 = 4096
 BTN_2 = 8192
 BTN_3 = 16384
 BTN_4 = 32768
 BTN_MODE = 67108864  # 0x04000000
+
+
+def _rotation_to_quat_xyzw(R: np.ndarray) -> np.ndarray:
+    quat = pin.Quaternion(np.asarray(R, dtype=np.float64).reshape(3, 3))
+    xyzw = np.asarray(quat.coeffs(), dtype=np.float64).reshape(4)
+    norm = float(np.linalg.norm(xyzw))
+    if norm < 1e-12:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    return xyzw / norm
+
+
+def _dual_tf_to_eepose_vec(left_tf: np.ndarray, right_tf: np.ndarray) -> list[float]:
+    left_tf = np.asarray(left_tf, dtype=np.float64).reshape(4, 4)
+    right_tf = np.asarray(right_tf, dtype=np.float64).reshape(4, 4)
+    left_xyz = left_tf[:3, 3].tolist()
+    left_xyzw = _rotation_to_quat_xyzw(left_tf[:3, :3]).tolist()
+    right_xyz = right_tf[:3, 3].tolist()
+    right_xyzw = _rotation_to_quat_xyzw(right_tf[:3, :3]).tolist()
+    return left_xyz + left_xyzw + right_xyz + right_xyzw
+
+
+def _default_record_parquet_path() -> str:
+    ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    return os.path.join(DEFAULT_RECORD_DIR, f"{ts}.parquet")
+
+
+class _SpacemouseParquetRecorder:
+    def __init__(self, output_path: str, frequency_hz: float, sync_mode: str, flush_interval: int):
+        self.output_path = output_path
+        self.sync_mode = str(sync_mode).lower()
+        self.flush_interval = max(0, int(flush_interval))
+        control_period_ns = int(1e9 / float(frequency_hz))
+        self.sync_threshold_ns = max(1, control_period_ns // 2)
+        self._lock = threading.Lock()
+        self._raw_rows: list[dict] = []
+        self._command_rows: list[dict] = []
+        self._raw_t_ns: list[int] = []
+        self._last_command_t_ns: int | None = None
+
+    def record_raw_event(
+        self,
+        t_ns: int,
+        tx: int,
+        ty: int,
+        tz: int,
+        rx: int,
+        ry: int,
+        rz: int,
+        buttons_mask: int,
+        edges_mask: int,
+    ):
+        with self._lock:
+            row = {
+                "raw.t_ns": int(t_ns),
+                "raw.tx": int(tx),
+                "raw.ty": int(ty),
+                "raw.tz": int(tz),
+                "raw.rx": int(rx),
+                "raw.ry": int(ry),
+                "raw.rz": int(rz),
+                "raw.buttons_mask": int(buttons_mask),
+                "raw.edges_mask": int(edges_mask),
+            }
+            self._raw_rows.append(row)
+            self._raw_t_ns.append(int(t_ns))
+
+    def _align_raw_to_command(self, t_ns: int) -> tuple[bool, int, str]:
+        if not self._raw_t_ns:
+            return False, -1, "none"
+        idx = bisect.bisect_left(self._raw_t_ns, t_ns)
+        candidates: list[tuple[int, int]] = []
+        if idx > 0:
+            left_t = self._raw_t_ns[idx - 1]
+            candidates.append((abs(t_ns - left_t), idx - 1))
+        if idx < len(self._raw_t_ns):
+            right_t = self._raw_t_ns[idx]
+            candidates.append((abs(t_ns - right_t), idx))
+        if not candidates:
+            return False, -1, "none"
+        nearest_abs_dt, nearest_idx = min(candidates, key=lambda x: x[0])
+        nearest_valid = nearest_abs_dt <= self.sync_threshold_ns
+        if self.sync_mode == "linear" and 0 < idx < len(self._raw_t_ns):
+            left_t = self._raw_t_ns[idx - 1]
+            right_t = self._raw_t_ns[idx]
+            left_dt = abs(t_ns - left_t)
+            right_dt = abs(right_t - t_ns)
+            if right_t > left_t and left_dt <= self.sync_threshold_ns and right_dt <= self.sync_threshold_ns:
+                return True, int(min(left_dt, right_dt)), "linear"
+        mode = "nearest" if nearest_valid else "none"
+        return bool(nearest_valid), int(nearest_abs_dt), mode
+
+    def record_command_tick(self, t_ns: int, ik_joint_pos: np.ndarray, left_tf: np.ndarray, right_tf: np.ndarray):
+        with self._lock:
+            t_ns = int(t_ns)
+            if self._last_command_t_ns is not None and t_ns <= self._last_command_t_ns:
+                t_ns = self._last_command_t_ns + 1
+            self._last_command_t_ns = t_ns
+            valid_mask, sync_dt_ns, interp_mode = self._align_raw_to_command(t_ns)
+            self._command_rows.append(
+                {
+                    "command.t_ns": t_ns,
+                    "command.ik_joint_pos": np.asarray(ik_joint_pos, dtype=np.float64).reshape(-1).tolist(),
+                    "command.eepose": _dual_tf_to_eepose_vec(left_tf, right_tf),
+                    "command.valid_mask": bool(valid_mask),
+                    "command.sync_dt_ns": int(sync_dt_ns),
+                    "command.interp_mode": interp_mode,
+                }
+            )
+            if self.flush_interval > 0 and len(self._command_rows) % self.flush_interval == 0:
+                self._write_locked()
+
+    def _build_rows_locked(self) -> list[dict]:
+        rows: list[dict] = []
+        for raw in self._raw_rows:
+            rows.append(
+                {
+                    "entry_type": "raw",
+                    "raw.t_ns": raw["raw.t_ns"],
+                    "raw.tx": raw["raw.tx"],
+                    "raw.ty": raw["raw.ty"],
+                    "raw.tz": raw["raw.tz"],
+                    "raw.rx": raw["raw.rx"],
+                    "raw.ry": raw["raw.ry"],
+                    "raw.rz": raw["raw.rz"],
+                    "raw.buttons_mask": raw["raw.buttons_mask"],
+                    "raw.edges_mask": raw["raw.edges_mask"],
+                    "command.t_ns": None,
+                    "command.ik_joint_pos": None,
+                    "command.eepose": None,
+                    "command.valid_mask": None,
+                    "command.sync_dt_ns": None,
+                    "command.interp_mode": None,
+                }
+            )
+        for cmd in self._command_rows:
+            rows.append(
+                {
+                    "entry_type": "command",
+                    "raw.t_ns": None,
+                    "raw.tx": None,
+                    "raw.ty": None,
+                    "raw.tz": None,
+                    "raw.rx": None,
+                    "raw.ry": None,
+                    "raw.rz": None,
+                    "raw.buttons_mask": None,
+                    "raw.edges_mask": None,
+                    "command.t_ns": cmd["command.t_ns"],
+                    "command.ik_joint_pos": cmd["command.ik_joint_pos"],
+                    "command.eepose": cmd["command.eepose"],
+                    "command.valid_mask": cmd["command.valid_mask"],
+                    "command.sync_dt_ns": cmd["command.sync_dt_ns"],
+                    "command.interp_mode": cmd["command.interp_mode"],
+                }
+            )
+        rows.sort(
+            key=lambda r: (
+                r["command.t_ns"] if r["command.t_ns"] is not None else r["raw.t_ns"],
+                0 if r["entry_type"] == "raw" else 1,
+            )
+        )
+        return rows
+
+    def _write_locked(self):
+        try:
+            import pandas as pd
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Parquet recording requires pandas + pyarrow. Install with `pip install pandas pyarrow`."
+            ) from exc
+        os.makedirs(os.path.dirname(os.path.abspath(self.output_path)), exist_ok=True)
+        rows = self._build_rows_locked()
+        df = pd.DataFrame(rows)
+        df.to_parquet(self.output_path, index=False)
+
+    def close(self):
+        with self._lock:
+            self._write_locked()
 
 
 def _read_text(path: str) -> str | None:
@@ -390,8 +571,26 @@ class SpaceMouseHidState:
             self._pending_edges = 0
             return snap
 
+    def peek(self):
+        with self._lock:
+            return (
+                self.tx,
+                self.ty,
+                self.tz,
+                self.rx,
+                self.ry,
+                self.rz,
+                int(self.buttons),
+            )
 
-def _hid_reader_loop(path: str, state: SpaceMouseHidState, stop_evt: threading.Event, exit_on_disconnect: bool):
+
+def _hid_reader_loop(
+    path: str,
+    state: SpaceMouseHidState,
+    stop_evt: threading.Event,
+    exit_on_disconnect: bool,
+    recorder: _SpacemouseParquetRecorder | None = None,
+):
     buttons_prev = 0
     buttons_initialized = False
     short_button_report_warned = False
@@ -419,9 +618,37 @@ def _hid_reader_loop(path: str, state: SpaceMouseHidState, stop_evt: threading.E
             if rid == 1 and len(data) >= 7:
                 tx, ty, tz = struct.unpack_from("<hhh", data, 1)
                 state.on_translation(tx, ty, tz)
+                if recorder is not None:
+                    t_ns = time.monotonic_ns()
+                    raw_tx, raw_ty, raw_tz, raw_rx, raw_ry, raw_rz, raw_buttons = state.peek()
+                    recorder.record_raw_event(
+                        t_ns=t_ns,
+                        tx=raw_tx,
+                        ty=raw_ty,
+                        tz=raw_tz,
+                        rx=raw_rx,
+                        ry=raw_ry,
+                        rz=raw_rz,
+                        buttons_mask=raw_buttons,
+                        edges_mask=0,
+                    )
             elif rid == 2 and len(data) >= 7:
                 rx, ry, rz = struct.unpack_from("<hhh", data, 1)
                 state.on_rotation(rx, ry, rz)
+                if recorder is not None:
+                    t_ns = time.monotonic_ns()
+                    raw_tx, raw_ty, raw_tz, raw_rx, raw_ry, raw_rz, raw_buttons = state.peek()
+                    recorder.record_raw_event(
+                        t_ns=t_ns,
+                        tx=raw_tx,
+                        ty=raw_ty,
+                        tz=raw_tz,
+                        rx=raw_rx,
+                        ry=raw_ry,
+                        rz=raw_rz,
+                        buttons_mask=raw_buttons,
+                        edges_mask=0,
+                    )
             elif rid == 3:
                 if len(data) < 5:
                     if not short_button_report_warned:
@@ -436,10 +663,25 @@ def _hid_reader_loop(path: str, state: SpaceMouseHidState, stop_evt: threading.E
                     buttons_prev = new_b
                     buttons_initialized = True
                     state.on_buttons(new_b, 0)
+                    pressed = 0
                 else:
                     pressed = new_b & ~buttons_prev
                     buttons_prev = new_b
                     state.on_buttons(new_b, pressed)
+                if recorder is not None:
+                    t_ns = time.monotonic_ns()
+                    raw_tx, raw_ty, raw_tz, raw_rx, raw_ry, raw_rz, raw_buttons = state.peek()
+                    recorder.record_raw_event(
+                        t_ns=t_ns,
+                        tx=raw_tx,
+                        ty=raw_ty,
+                        tz=raw_tz,
+                        rx=raw_rx,
+                        ry=raw_ry,
+                        rz=raw_rz,
+                        buttons_mask=raw_buttons,
+                        edges_mask=int(pressed),
+                    )
     finally:
         if fd is not None:
             try:
@@ -560,6 +802,28 @@ def build_arg_parser():
     parser.add_argument("--inspire-gripper-alpha", type=float, default=0.2)
     parser.add_argument("--inspire-gripper-max-speed", type=float, default=1.5)
     parser.add_argument("--go-home-on-exit", action="store_true", help="Send both arms home on exit")
+    parser.add_argument(
+        "--record-parquet",
+        type=str,
+        default="auto",
+        help=(
+            "Write raw/command streams into a single parquet file. "
+            "Default is auto: /home/gsy/work/fastsim/record/<YYYYMMDD-HHMMSS>.parquet"
+        ),
+    )
+    parser.add_argument(
+        "--record-sync-mode",
+        type=str,
+        choices=["nearest", "linear"],
+        default="nearest",
+        help="Raw-to-command alignment mode used to set command.valid_mask.",
+    )
+    parser.add_argument(
+        "--record-flush-interval",
+        type=int,
+        default=0,
+        help="Optional periodic checkpoint write every N command ticks (0 disables periodic flush).",
+    )
     return parser
 
 
@@ -599,11 +863,27 @@ def main(argv=None):
     stop_evt = threading.Event()
     hid_thread = None
     sm_state = SpaceMouseHidState()
+    recorder = None
 
     flip = np.array([float(args.flip_x), float(args.flip_y), float(args.flip_z)], dtype=np.float64)
     rot_axis_scale = np.array(args.rot_axis_scale, dtype=np.float64)
 
     try:
+        if args.record_parquet:
+            if str(args.record_parquet).lower() == "auto":
+                args.record_parquet = _default_record_parquet_path()
+            recorder = _SpacemouseParquetRecorder(
+                output_path=args.record_parquet,
+                frequency_hz=float(args.frequency),
+                sync_mode=args.record_sync_mode,
+                flush_interval=int(args.record_flush_interval),
+            )
+            logger_mp.info(
+                "Command recorder enabled: %s (sync=%s, threshold_ns=%d)",
+                args.record_parquet,
+                args.record_sync_mode,
+                recorder.sync_threshold_ns,
+            )
         arm_ik, arm_ctrl = _build_arm_stack(args.arm, simulation_mode=args.sim)
         (
             gripper_ctrl,
@@ -627,7 +907,7 @@ def main(argv=None):
 
         hid_thread = threading.Thread(
             target=_hid_reader_loop,
-            args=(args.hidraw_device, sm_state, stop_evt, args.exit_on_disconnect),
+            args=(args.hidraw_device, sm_state, stop_evt, args.exit_on_disconnect, recorder),
             daemon=True,
         )
         hid_thread.start()
@@ -659,6 +939,7 @@ def main(argv=None):
 
         while not stop_evt.is_set():
             tick_t0 = time.time()
+            tick_t_ns = time.monotonic_ns()
             tx, ty, tz, rx, ry, rz, raw_buttons, edges = sm_state.snapshot()
 
             if args.debug_buttons and raw_buttons != last_raw_buttons:
@@ -765,6 +1046,13 @@ def main(argv=None):
             else:
                 sol_q = hold_q
                 sol_tauff = hold_tauff
+            if recorder is not None:
+                recorder.record_command_tick(
+                    t_ns=tick_t_ns,
+                    ik_joint_pos=sol_q,
+                    left_tf=left_target_tf,
+                    right_tf=right_target_tf,
+                )
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
 
             now = time.time()
@@ -804,6 +1092,12 @@ def main(argv=None):
                 arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error("Failed to send go-home on exit: %s", e)
+        try:
+            if recorder is not None:
+                recorder.close()
+                logger_mp.info("Wrote command parquet: %s", args.record_parquet)
+        except Exception as e:
+            logger_mp.error("Failed to write command parquet %s: %s", args.record_parquet, e)
         logger_mp.info("Exit SpaceMouse ee teleop.")
 
 
