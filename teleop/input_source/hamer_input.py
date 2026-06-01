@@ -51,6 +51,22 @@ def _rotvec_to_mat33(v: np.ndarray) -> np.ndarray:
     return np.eye(3) + np.sin(theta) * K + (1.0 - np.cos(theta)) * (K @ K)
 
 
+def _quat_xyzw_to_mat33(q) -> np.ndarray:
+    quat = np.asarray(q, dtype=np.float64).reshape(4)
+    norm = float(np.linalg.norm(quat))
+    if norm < 1e-12:
+        raise ValueError("zero-norm quaternion")
+    x, y, z, w = quat / norm
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
 def _normalize_vec(v: np.ndarray, eps: float = 1e-8) -> Optional[np.ndarray]:
     v = np.asarray(v, dtype=np.float64).reshape(-1)
     n = float(np.linalg.norm(v))
@@ -500,17 +516,39 @@ class HamerParquetReader:
         pd = _import_pandas()
         df = pd.read_parquet(self.parquet_path)
         columns = list(df.columns)
+        has_spacemouse_eepose = "command.eepose" in columns
+        if has_spacemouse_eepose and "entry_type" in columns:
+            df = df.loc[(df["entry_type"].astype(str) == "command") & df["command.eepose"].notna()].copy()
+            if df.empty:
+                raise ValueError(f"No command rows with command.eepose in parquet: {self.parquet_path}")
+            df = df.sort_values("command.t_ns", kind="mergesort") if "command.t_ns" in df.columns else df
+            columns = list(df.columns)
 
         left_col = _choose_col(columns, ["left_kp3d", "observation.left_kp3d"])
         right_col = _choose_col(columns, ["right_kp3d", "observation.right_kp3d"])
         frame_col = _choose_col(columns, ["frame_index", "episode_frame_index"])
-        ts_col = _choose_col(columns, ["timestamp"])
-        gripper_col = _choose_col(columns, [self.gripper_action_key])
-        joint_col = _choose_col(columns, [self.joint_action_key])
+        ts_col = _choose_col(columns, ["timestamp", "command.t_ns"])
+        gripper_col = _choose_col(
+            columns,
+            [
+                self.gripper_action_key,
+                "aug.left_gripper_closed_smooth",
+                "aug.left_gripper_closed_raw",
+            ],
+        )
+        right_gripper_col = _choose_col(
+            columns,
+            [
+                "aug.right_gripper_closed_smooth",
+                "aug.right_gripper_closed_raw",
+            ],
+        )
+        joint_col = _choose_col(columns, [self.joint_action_key, "command.ik_joint_pos"])
         subtask_col = _choose_col(columns, ["subtask_index", "annotation.human.subtask_description"])
         arm_pose_col = _choose_col(
             columns,
             [
+                "command.eepose",
                 "action",
                 "observation.state",
                 "original_action",
@@ -522,9 +560,14 @@ class HamerParquetReader:
         if (not has_kp3d) and (arm_pose_col is None):
             raise ValueError(
                 "Parquet must include either left/right kp3d columns or one vector pose column "
-                f"(action/observation.state/original_action/original_state), got columns like: {columns[:20]}"
+                f"(command.eepose/action/observation.state/original_action/original_state), got columns like: {columns[:20]}"
             )
-        if not has_kp3d:
+        if has_spacemouse_eepose:
+            logger_mp.info(
+                "[HamerParquetReader] using SpaceMouse command.eepose as base-frame EE pose; "
+                "replay should use --hamer-arm-control-source ik."
+            )
+        elif not has_kp3d:
             logger_mp.warning(
                 f"[HamerParquetReader] left/right kp3d not found, fallback to arm pose vector '{arm_pose_col}'. "
                 "Assume [x,y,z,roll,pitch,yaw] in action slices left[16:22], right[23:29]."
@@ -563,9 +606,18 @@ class HamerParquetReader:
         frames: List[Dict[str, Any]] = []
         last_left_gripper = 1.0
         last_right_gripper = 1.0
+        first_t_ns = None
+        if ts_col == "command.t_ns" and len(df) > 0:
+            try:
+                first_t_ns = float(df.iloc[0][ts_col])
+            except Exception:
+                first_t_ns = None
         for i, row in df.iterrows():
             fi = int(row[frame_col]) if frame_col is not None else int(i)
-            ts = float(row[ts_col]) if ts_col is not None else 0.0
+            if ts_col == "command.t_ns" and first_t_ns is not None:
+                ts = max(0.0, (float(row[ts_col]) - first_t_ns) / 1e9)
+            else:
+                ts = float(row[ts_col]) if ts_col is not None else 0.0
 
             frame = {
                 "frame_idx": fi,
@@ -597,14 +649,22 @@ class HamerParquetReader:
                     subtask_idx, last_left_gripper, last_right_gripper
                 )
             elif gripper_col is not None:
-                action_arr = np.asarray(row[gripper_col], dtype=np.float64).reshape(-1)
-                if action_arr.size > max(self.gripper_left_idx, self.gripper_right_idx):
-                    lv = float(action_arr[self.gripper_left_idx])
-                    rv = float(action_arr[self.gripper_right_idx])
+                if gripper_col.startswith("aug.left_gripper_closed"):
+                    lv = float(row[gripper_col])
+                    rv = float(row[right_gripper_col]) if right_gripper_col is not None else last_right_gripper
                     if np.isfinite(lv):
                         left_gripper = lv
                     if np.isfinite(rv):
                         right_gripper = rv
+                else:
+                    action_arr = np.asarray(row[gripper_col], dtype=np.float64).reshape(-1)
+                    if action_arr.size > max(self.gripper_left_idx, self.gripper_right_idx):
+                        lv = float(action_arr[self.gripper_left_idx])
+                        rv = float(action_arr[self.gripper_right_idx])
+                        if np.isfinite(lv):
+                            left_gripper = lv
+                        if np.isfinite(rv):
+                            right_gripper = rv
             if left_gripper is not None:
                 last_left_gripper = float(left_gripper)
             if right_gripper is not None:
@@ -630,6 +690,25 @@ class HamerParquetReader:
                         "hand_pose": np.asarray([], dtype=np.float64),
                         "global_orient": np.asarray([], dtype=np.float64),
                         "keypoints_3d_local": (kp21 - kp21[0:1, :]),
+                        "score": 1.0,
+                        "gripper_input": left_gripper if side == "left" else right_gripper,
+                    }
+            elif has_spacemouse_eepose:
+                pose_arr = np.asarray(row["command.eepose"], dtype=np.float64).reshape(-1)
+                if pose_arr.size != 14 or (not np.all(np.isfinite(pose_arr))):
+                    continue
+                for side, s0 in (("left", 0), ("right", 7)):
+                    p_ee = pose_arr[s0 : s0 + 3].copy()
+                    R_ee = _quat_xyzw_to_mat33(pose_arr[s0 + 3 : s0 + 7])
+                    frame[side] = {
+                        "valid": True,
+                        "p_ee_base": p_ee,
+                        "R_ee_base": R_ee,
+                        "p_wrist_base": p_ee.copy(),
+                        "R_wrist_base": R_ee.copy(),
+                        "hand_pose": np.asarray([], dtype=np.float64),
+                        "global_orient": np.asarray([], dtype=np.float64),
+                        "keypoints_3d_local": np.zeros((0, 3), dtype=np.float64),
                         "score": 1.0,
                         "gripper_input": left_gripper if side == "left" else right_gripper,
                     }

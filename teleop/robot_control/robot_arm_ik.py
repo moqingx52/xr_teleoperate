@@ -56,29 +56,43 @@ class G1_29_ArmIK:
         # Try loading cache first
         if os.path.exists(self.cache_path) and (not self.Visualization):
             logger_mp.info(f"[G1_29_ArmIK] >>> Loading cached robot model: {self.cache_path}")
-            self.robot, self.reduced_robot = self.load_cache()
+            try:
+                self.robot, self.reduced_robot = self.load_cache()
+                self._setup_solver_from_reduced_model()
+            except Exception as exc:
+                logger_mp.warning(
+                    f"[G1_29_ArmIK] failed to load cache {self.cache_path}: {type(exc).__name__}: {exc}; rebuilding."
+                )
+                try:
+                    os.remove(self.cache_path)
+                except OSError:
+                    pass
+                self._load_urdf_and_build_reduced_model()
         else:
-            logger_mp.info("[G1_29_ArmIK] >>> Loading URDF (slow)...")
-            self.robot = pin.RobotWrapper.BuildFromURDF(self.urdf_path, self.model_dir)
+            self._load_urdf_and_build_reduced_model()
 
-            if self._use_a2d_omnipicker_urdf:
-                active_arm_joint_names = [
-                    "Joint1_l", "Joint2_l", "Joint3_l", "Joint4_l", "Joint5_l", "Joint6_l", "Joint7_l",
-                    "Joint1_r", "Joint2_r", "Joint3_r", "Joint4_r", "Joint5_r", "Joint6_r", "Joint7_r",
-                ]
-                model_joint_names = set(self.robot.model.names)
-                missing = [n for n in active_arm_joint_names if n not in model_joint_names]
-                if missing:
-                    raise ValueError(
-                        f"[G1_29_ArmIK] omnipicker active arm joints missing in URDF: {missing}"
-                    )
-                # Keep only 14 arm joints movable for IK; lock all other joints.
-                self.mixed_jointsToLockIDs = [
-                    n for n in self.robot.model.names
-                    if n not in active_arm_joint_names and n != "universe"
-                ]
-            else:
-                self.mixed_jointsToLockIDs = [
+    def _load_urdf_and_build_reduced_model(self):
+        logger_mp.info("[G1_29_ArmIK] >>> Loading URDF (slow)...")
+        self.robot = pin.RobotWrapper.BuildFromURDF(self.urdf_path, self.model_dir)
+
+        if self._use_a2d_omnipicker_urdf:
+            active_arm_joint_names = [
+                "Joint1_l", "Joint2_l", "Joint3_l", "Joint4_l", "Joint5_l", "Joint6_l", "Joint7_l",
+                "Joint1_r", "Joint2_r", "Joint3_r", "Joint4_r", "Joint5_r", "Joint6_r", "Joint7_r",
+            ]
+            model_joint_names = set(self.robot.model.names)
+            missing = [n for n in active_arm_joint_names if n not in model_joint_names]
+            if missing:
+                raise ValueError(
+                    f"[G1_29_ArmIK] omnipicker active arm joints missing in URDF: {missing}"
+                )
+            # Keep only 14 arm joints movable for IK; lock all other joints.
+            self.mixed_jointsToLockIDs = [
+                n for n in self.robot.model.names
+                if n not in active_arm_joint_names and n != "universe"
+            ]
+        else:
+            self.mixed_jointsToLockIDs = [
                                                 "left_hip_pitch_joint" ,
                                                 "left_hip_roll_joint" ,
                                                 "left_hip_yaw_joint" ,
@@ -112,52 +126,52 @@ class G1_29_ArmIK:
                                                 "right_hand_middle_1_joint"
                                             ]
 
-            self.reduced_robot = self.robot.buildReducedRobot(
-                list_of_joints_to_lock=self.mixed_jointsToLockIDs,
-                reference_configuration=np.array([0.0] * self.robot.model.nq),
-            )
+        self.reduced_robot = self.robot.buildReducedRobot(
+            list_of_joints_to_lock=self.mixed_jointsToLockIDs,
+            reference_configuration=np.array([0.0] * self.robot.model.nq),
+        )
 
-            if self._use_a2d_omnipicker_urdf:
-                # Prefer URDF native hand-base frames as EE.
-                frame_names = [f.name for f in self.reduced_robot.model.frames]
-                if "left_base_link" in frame_names and "right_base_link" in frame_names:
-                    pass
-                else:
-                    self.reduced_robot.model.addFrame(
-                        pin.Frame(
-                            'L_ee',
-                            self.reduced_robot.model.getJointId('Joint7_l'),
-                            pin.SE3(np.eye(3), np.array([0.0, 0.0, 0.0]).T),
-                            pin.FrameType.OP_FRAME
-                        )
-                    )
-                    self.reduced_robot.model.addFrame(
-                        pin.Frame(
-                            'R_ee',
-                            self.reduced_robot.model.getJointId('Joint7_r'),
-                            pin.SE3(np.eye(3), np.array([0.0, 0.0, 0.0]).T),
-                            pin.FrameType.OP_FRAME
-                        )
-                    )
+        if self._use_a2d_omnipicker_urdf:
+            # Prefer URDF native hand-base frames as EE.
+            frame_names = [f.name for f in self.reduced_robot.model.frames]
+            if "left_base_link" in frame_names and "right_base_link" in frame_names:
+                pass
             else:
                 self.reduced_robot.model.addFrame(
-                    pin.Frame('L_ee',
-                            self.reduced_robot.model.getJointId('left_wrist_yaw_joint'),
-                            pin.SE3(np.eye(3),
-                                    np.array([0.05,0,0]).T),
-                            pin.FrameType.OP_FRAME)
+                    pin.Frame(
+                        'L_ee',
+                        self.reduced_robot.model.getJointId('Joint7_l'),
+                        pin.SE3(np.eye(3), np.array([0.0, 0.0, 0.0]).T),
+                        pin.FrameType.OP_FRAME
+                    )
                 )
                 self.reduced_robot.model.addFrame(
-                    pin.Frame('R_ee',
-                            self.reduced_robot.model.getJointId('right_wrist_yaw_joint'),
-                            pin.SE3(np.eye(3),
-                                    np.array([0.05,0,0]).T),
-                            pin.FrameType.OP_FRAME)
+                    pin.Frame(
+                        'R_ee',
+                        self.reduced_robot.model.getJointId('Joint7_r'),
+                        pin.SE3(np.eye(3), np.array([0.0, 0.0, 0.0]).T),
+                        pin.FrameType.OP_FRAME
+                    )
                 )
-            # Save cache (only after everything is built)
-            if not os.path.exists(self.cache_path):
-                self.save_cache()
-                logger_mp.info(f">>> Cache saved to {self.cache_path}")
+        else:
+            self.reduced_robot.model.addFrame(
+                pin.Frame('L_ee',
+                        self.reduced_robot.model.getJointId('left_wrist_yaw_joint'),
+                        pin.SE3(np.eye(3),
+                                np.array([0.05,0,0]).T),
+                        pin.FrameType.OP_FRAME)
+            )
+            self.reduced_robot.model.addFrame(
+                pin.Frame('R_ee',
+                        self.reduced_robot.model.getJointId('right_wrist_yaw_joint'),
+                        pin.SE3(np.eye(3),
+                                np.array([0.05,0,0]).T),
+                        pin.FrameType.OP_FRAME)
+            )
+        # Save cache (only after everything is built)
+        if not os.path.exists(self.cache_path):
+            self.save_cache()
+            logger_mp.info(f">>> Cache saved to {self.cache_path}")
 
         # for i in range(self.reduced_robot.model.nframes):
         #     frame = self.reduced_robot.model.frames[i]
@@ -243,6 +257,91 @@ class G1_29_ArmIK:
             'ipopt.derivative_test': 'none',
             'ipopt.jacobian_approximation': 'exact',
             # 'ipopt.hessian_approximation': 'limited-memory',
+        }
+        self.opti.solver("ipopt", opts)
+
+        self.init_data = np.zeros(self.reduced_robot.model.nq)
+        self.smooth_filter = WeightedMovingFilter(np.array([0.4, 0.3, 0.2, 0.1]), 14)
+        self.vis = None
+
+    def _setup_solver_from_reduced_model(self):
+        self.cmodel = cpin.Model(self.reduced_robot.model)
+        self.cdata = self.cmodel.createData()
+
+        self.cq = casadi.SX.sym("q", self.reduced_robot.model.nq, 1)
+        self.cTf_l = casadi.SX.sym("tf_l", 4, 4)
+        self.cTf_r = casadi.SX.sym("tf_r", 4, 4)
+        cpin.framesForwardKinematics(self.cmodel, self.cdata, self.cq)
+
+        if self._use_a2d_omnipicker_urdf:
+            frame_names = [f.name for f in self.reduced_robot.model.frames]
+            if "left_base_link" in frame_names:
+                self.L_hand_id = self.reduced_robot.model.getFrameId("left_base_link")
+                self.R_hand_id = self.reduced_robot.model.getFrameId("right_base_link")
+            else:
+                self.L_hand_id = self.reduced_robot.model.getFrameId("L_ee")
+                self.R_hand_id = self.reduced_robot.model.getFrameId("R_ee")
+        else:
+            self.L_hand_id = self.reduced_robot.model.getFrameId("L_ee")
+            self.R_hand_id = self.reduced_robot.model.getFrameId("R_ee")
+
+        self.translational_error = casadi.Function(
+            "translational_error",
+            [self.cq, self.cTf_l, self.cTf_r],
+            [
+                casadi.vertcat(
+                    self.cdata.oMf[self.L_hand_id].translation - self.cTf_l[:3, 3],
+                    self.cdata.oMf[self.R_hand_id].translation - self.cTf_r[:3, 3],
+                )
+            ],
+        )
+        self.rotational_error = casadi.Function(
+            "rotational_error",
+            [self.cq, self.cTf_l, self.cTf_r],
+            [
+                casadi.vertcat(
+                    cpin.log3(self.cdata.oMf[self.L_hand_id].rotation @ self.cTf_l[:3, :3].T),
+                    cpin.log3(self.cdata.oMf[self.R_hand_id].rotation @ self.cTf_r[:3, :3].T),
+                )
+            ],
+        )
+
+        self.opti = casadi.Opti()
+        self.var_q = self.opti.variable(self.reduced_robot.model.nq)
+        self.var_q_last = self.opti.parameter(self.reduced_robot.model.nq)
+        self.param_tf_l = self.opti.parameter(4, 4)
+        self.param_tf_r = self.opti.parameter(4, 4)
+        self.translational_cost = casadi.sumsqr(self.translational_error(self.var_q, self.param_tf_l, self.param_tf_r))
+        self.rotation_cost = casadi.sumsqr(self.rotational_error(self.var_q, self.param_tf_l, self.param_tf_r))
+        self.regularization_cost = casadi.sumsqr(self.var_q)
+        self.smooth_cost = casadi.sumsqr(self.var_q - self.var_q_last)
+        self.opti.subject_to(
+            self.opti.bounded(
+                self.reduced_robot.model.lowerPositionLimit,
+                self.var_q,
+                self.reduced_robot.model.upperPositionLimit,
+            )
+        )
+        self.opti.minimize(
+            50 * self.translational_cost
+            + self.rotation_cost
+            + 0.02 * self.regularization_cost
+            + 0.1 * self.smooth_cost
+        )
+        opts = {
+            "expand": True,
+            "detect_simple_bounds": True,
+            "calc_lam_p": False,
+            "print_time": False,
+            "ipopt.sb": "yes",
+            "ipopt.print_level": 0,
+            "ipopt.max_iter": 30,
+            "ipopt.tol": 1e-4,
+            "ipopt.acceptable_tol": 5e-4,
+            "ipopt.acceptable_iter": 5,
+            "ipopt.warm_start_init_point": "yes",
+            "ipopt.derivative_test": "none",
+            "ipopt.jacobian_approximation": "exact",
         }
         self.opti.solver("ipopt", opts)
 

@@ -15,7 +15,13 @@ parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
-from televuer import TeleVuerWrapper
+try:
+    from televuer import TeleVuerWrapper
+except Exception as exc:  # noqa: BLE001 - offline replay does not need XR UI deps.
+    TeleVuerWrapper = None
+    _TELEVUER_IMPORT_ERROR = exc
+else:
+    _TELEVUER_IMPORT_ERROR = None
 from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController
 from teleop.robot_control.robot_arm_ik import (
     G1_29_ArmIK,
@@ -24,8 +30,13 @@ from teleop.robot_control.robot_arm_ik import (
     H1_ArmIK,
     homogeneous_from_position_rotation,
 )
-from teleimager.image_client import ImageClient
-from teleop.utils.episode_writer import EpisodeWriter
+try:
+    from teleimager.image_client import ImageClient
+except Exception as exc:  # noqa: BLE001 - offline replay can run without camera client deps.
+    ImageClient = None
+    _IMAGE_CLIENT_IMPORT_ERROR = exc
+else:
+    _IMAGE_CLIENT_IMPORT_ERROR = None
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from sshkeyboard import listen_keyboard, stop_listening
@@ -634,15 +645,25 @@ def main(argv=None):
             ipc_server = IPC_Server(on_press=on_press,get_state=get_state)
             ipc_server.start()
         # sshkeyboard communication mode
-        else:
+        elif args.input_source not in ("hamer", "egodex"):
             listen_keyboard_thread = threading.Thread(target=listen_keyboard, 
                                                       kwargs={"on_press": on_press, "until": None, "sequential": False,}, 
                                                       daemon=True)
             listen_keyboard_thread.start()
 
         # image client
-        img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
-        camera_config = img_client.get_cam_config()
+        img_client = None
+        if args.input_source in ("hamer", "egodex") and not args.record:
+            camera_config = {
+                "head_camera": {"enable_zmq": False, "enable_webrtc": False, "binocular": False, "image_shape": [0, 0]},
+                "left_wrist_camera": {"enable_zmq": False},
+                "right_wrist_camera": {"enable_zmq": False},
+            }
+        else:
+            if ImageClient is None:
+                raise RuntimeError(f"Failed to import ImageClient: {_IMAGE_CLIENT_IMPORT_ERROR}")
+            img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
+            camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
         if args.input_source in ("hamer", "egodex"):
@@ -659,6 +680,8 @@ def main(argv=None):
         last_right_gripper_input = float(args.gripper_input_max)
 
         if args.input_source == "xr":
+            if TeleVuerWrapper is None:
+                raise RuntimeError(f"Failed to import TeleVuerWrapper: {_TELEVUER_IMPORT_ERROR}")
             tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand",
                                          binocular=camera_config['head_camera']['binocular'],
                                          img_shape=camera_config['head_camera']['image_shape'],
@@ -915,6 +938,8 @@ def main(argv=None):
 
         # record + headless / non-headless mode
         if args.record:
+            from teleop.utils.episode_writer import EpisodeWriter
+
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
@@ -931,6 +956,9 @@ def main(argv=None):
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
+        if args.input_source in ("hamer", "egodex"):
+            START = True
+            logger_mp.info(f"{args.input_source} offline replay auto-start enabled.")
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
             if tv_wrapper is not None and camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
@@ -1319,6 +1347,7 @@ def main(argv=None):
         STOP = True
         import traceback
         logger_mp.error(traceback.format_exc())
+        raise
     finally:
         STOP = True
         try:
@@ -1337,7 +1366,8 @@ def main(argv=None):
             logger_mp.error(f"Failed to stop keyboard listener or ipc server: {e}")
         
         try:
-            img_client.close()
+            if img_client is not None:
+                img_client.close()
         except Exception as e:
             logger_mp.error(f"Failed to close image client: {e}")
 

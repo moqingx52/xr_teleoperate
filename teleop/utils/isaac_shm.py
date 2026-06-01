@@ -4,34 +4,45 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from multiprocessing import shared_memory
 from multiprocessing import resource_tracker
 from typing import Any, Dict, Optional
 
+def _namespaced(name: str) -> str:
+    namespace = os.environ.get("JOYSIM_SHM_NAMESPACE", "").strip()
+    if not namespace:
+        return name
+    return f"{name}_{namespace}"
+
+
 # Names/sizes must match unitree_sim_isaaclab/dds/*.py
-SHM_ROBOT_STATE = "isaac_robot_state"
-SHM_ROBOT_CMD = "dds_robot_cmd"
+SHM_ROBOT_STATE = _namespaced("isaac_robot_state")
+SHM_ROBOT_CMD = _namespaced("dds_robot_cmd")
 SIZE_ROBOT = 3072
 
-SHM_DEX3_STATE = "isaac_dex3_state"
-SHM_DEX3_CMD = "isaac_dex3_cmd"
+SHM_DEX3_STATE = _namespaced("isaac_dex3_state")
+SHM_DEX3_CMD = _namespaced("isaac_dex3_cmd")
 SIZE_DEX3 = 1180
 
-SHM_GRIPPER_STATE = "isaac_gripper_state"
-SHM_GRIPPER_CMD = "isaac_gripper_cmd"
+SHM_GRIPPER_STATE = _namespaced("isaac_gripper_state")
+SHM_GRIPPER_CMD = _namespaced("isaac_gripper_cmd")
 SIZE_GRIPPER = 512
 
-SHM_INSPIRE_STATE = "isaac_inspire_state"
-SHM_INSPIRE_CMD = "isaac_inspire_cmd"
+SHM_INSPIRE_STATE = _namespaced("isaac_inspire_state")
+SHM_INSPIRE_CMD = _namespaced("isaac_inspire_cmd")
 SIZE_INSPIRE = 1024
 
-SHM_SIM_STATE = "isaac_sim_state"
+SHM_SIM_STATE = _namespaced("isaac_sim_state")
 SIZE_SIM_STATE = 4096
 
-SHM_RESET_POSE_CMD = "isaac_reset_pose_cmd"
+SHM_RESET_POSE_CMD = _namespaced("isaac_reset_pose_cmd")
 SIZE_RESET_POSE = 512
+
+SHM_REPLAY_EPISODE_CTL = _namespaced("isaac_replay_episode_ctl")
+SIZE_REPLAY_EPISODE_CTL = 4096
 
 
 class IsaacJsonShm:

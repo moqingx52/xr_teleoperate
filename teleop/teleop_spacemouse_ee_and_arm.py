@@ -805,10 +805,11 @@ def build_arg_parser():
     parser.add_argument(
         "--record-parquet",
         type=str,
-        default="auto",
+        default=None,
         help=(
-            "Write raw/command streams into a single parquet file. "
-            "Default is auto: /home/gsy/work/fastsim/record/<YYYYMMDD-HHMMSS>.parquet"
+            "Optionally write raw/command streams into a single parquet file. "
+            "Use 'auto' for /home/gsy/work/fastsim/record/<YYYYMMDD-HHMMSS>.parquet. "
+            "Disabled by default; JoySim recorder owns camera video output."
         ),
     )
     parser.add_argument(
