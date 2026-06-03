@@ -113,6 +113,11 @@ def load_replay_data(path: Path, smooth_alpha: float) -> ReplayData:
     if "aug.left_gripper_closed_smooth" in cmd.columns and "aug.right_gripper_closed_smooth" in cmd.columns:
         left = cmd["aug.left_gripper_closed_smooth"].ffill().fillna(0.0).to_numpy(dtype=np.float64)
         right = cmd["aug.right_gripper_closed_smooth"].ffill().fillna(0.0).to_numpy(dtype=np.float64)
+    elif "command.left_gripper_input" in cmd.columns and "command.right_gripper_input" in cmd.columns:
+        left_input = cmd["command.left_gripper_input"].ffill().fillna(1.0).to_numpy(dtype=np.float64)
+        right_input = cmd["command.right_gripper_input"].ffill().fillna(1.0).to_numpy(dtype=np.float64)
+        left = np.clip(1.0 - left_input, 0.0, 1.0)
+        right = np.clip(1.0 - right_input, 0.0, 1.0)
     else:
         left, right = _reconstruct_gripper_from_raw(df, t_ns, smooth_alpha=smooth_alpha)
 
@@ -158,6 +163,13 @@ def _make_gripper_controller(args: argparse.Namespace):
         return None, None, None
     from teleop.robot_control.robot_hand_inspire import Inspire_Gripper_Controller
 
+    if args.gripper_sides == "left":
+        active_sides = ("left",)
+    elif args.gripper_sides == "right":
+        active_sides = ("right",)
+    else:
+        active_sides = ("left", "right")
+
     left_value = Value("d", float(args.gripper_open_input), lock=True)
     right_value = Value("d", float(args.gripper_open_input), lock=True)
     data_lock = Lock()
@@ -176,6 +188,7 @@ def _make_gripper_controller(args: argparse.Namespace):
         close_cmd=float(args.inspire_gripper_close),
         smooth_alpha=float(args.inspire_gripper_alpha),
         max_speed=float(args.inspire_gripper_max_speed),
+        active_sides=active_sides,
     )
     return controller, left_value, right_value
 
@@ -247,15 +260,21 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--real", action="store_true", help="Use real robot DDS")
     parser.add_argument("--network-interface", default=None)
     parser.add_argument("--ee", choices=["none", "inspire_gripper", "omnipicker"], default="inspire_gripper")
+    parser.add_argument(
+        "--gripper-sides",
+        choices=["both", "left", "right"],
+        default="both",
+        help="Which OmniPicker gripper side should be actively driven during replay.",
+    )
     parser.add_argument("--smooth-alpha", type=float, default=0.25, help="EMA alpha when reconstructing gripper from raw")
     parser.add_argument("--gripper-input-min", type=float, default=0.0)
     parser.add_argument("--gripper-input-max", type=float, default=1.0)
     parser.add_argument("--gripper-open-input", type=float, default=1.0)
     parser.add_argument("--gripper-close-input", type=float, default=0.0)
     parser.add_argument("--inspire-gripper-open", type=float, default=0.0)
-    parser.add_argument("--inspire-gripper-close", type=float, default=1.2)
-    parser.add_argument("--inspire-gripper-alpha", type=float, default=0.2)
-    parser.add_argument("--inspire-gripper-max-speed", type=float, default=1.5)
+    parser.add_argument("--inspire-gripper-close", type=float, default=0.75)
+    parser.add_argument("--inspire-gripper-alpha", type=float, default=0.05)
+    parser.add_argument("--inspire-gripper-max-speed", type=float, default=0.20)
     parser.add_argument("--print-period", type=float, default=0.5)
     parser.add_argument("--go-home-on-exit", action="store_true")
     return parser.parse_args(argv)

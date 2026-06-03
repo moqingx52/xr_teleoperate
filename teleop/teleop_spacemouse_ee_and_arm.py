@@ -143,7 +143,19 @@ class _SpacemouseParquetRecorder:
         mode = "nearest" if nearest_valid else "none"
         return bool(nearest_valid), int(nearest_abs_dt), mode
 
-    def record_command_tick(self, t_ns: int, ik_joint_pos: np.ndarray, left_tf: np.ndarray, right_tf: np.ndarray):
+    def record_command_tick(
+        self,
+        t_ns: int,
+        ik_joint_pos: np.ndarray,
+        left_tf: np.ndarray,
+        right_tf: np.ndarray,
+        left_gripper_input: float | None = None,
+        right_gripper_input: float | None = None,
+        left_gripper_action: float | None = None,
+        right_gripper_action: float | None = None,
+        left_gripper_state: float | None = None,
+        right_gripper_state: float | None = None,
+    ):
         with self._lock:
             t_ns = int(t_ns)
             if self._last_command_t_ns is not None and t_ns <= self._last_command_t_ns:
@@ -155,6 +167,12 @@ class _SpacemouseParquetRecorder:
                     "command.t_ns": t_ns,
                     "command.ik_joint_pos": np.asarray(ik_joint_pos, dtype=np.float64).reshape(-1).tolist(),
                     "command.eepose": _dual_tf_to_eepose_vec(left_tf, right_tf),
+                    "command.left_gripper_input": left_gripper_input,
+                    "command.right_gripper_input": right_gripper_input,
+                    "command.left_gripper_action": left_gripper_action,
+                    "command.right_gripper_action": right_gripper_action,
+                    "command.left_gripper_state": left_gripper_state,
+                    "command.right_gripper_state": right_gripper_state,
                     "command.valid_mask": bool(valid_mask),
                     "command.sync_dt_ns": int(sync_dt_ns),
                     "command.interp_mode": interp_mode,
@@ -181,6 +199,12 @@ class _SpacemouseParquetRecorder:
                     "command.t_ns": None,
                     "command.ik_joint_pos": None,
                     "command.eepose": None,
+                    "command.left_gripper_input": None,
+                    "command.right_gripper_input": None,
+                    "command.left_gripper_action": None,
+                    "command.right_gripper_action": None,
+                    "command.left_gripper_state": None,
+                    "command.right_gripper_state": None,
                     "command.valid_mask": None,
                     "command.sync_dt_ns": None,
                     "command.interp_mode": None,
@@ -202,6 +226,12 @@ class _SpacemouseParquetRecorder:
                     "command.t_ns": cmd["command.t_ns"],
                     "command.ik_joint_pos": cmd["command.ik_joint_pos"],
                     "command.eepose": cmd["command.eepose"],
+                    "command.left_gripper_input": cmd["command.left_gripper_input"],
+                    "command.right_gripper_input": cmd["command.right_gripper_input"],
+                    "command.left_gripper_action": cmd["command.left_gripper_action"],
+                    "command.right_gripper_action": cmd["command.right_gripper_action"],
+                    "command.left_gripper_state": cmd["command.left_gripper_state"],
+                    "command.right_gripper_state": cmd["command.right_gripper_state"],
                     "command.valid_mask": cmd["command.valid_mask"],
                     "command.sync_dt_ns": cmd["command.sync_dt_ns"],
                     "command.interp_mode": cmd["command.interp_mode"],
@@ -480,6 +510,72 @@ def _build_gripper_controller(args):
         dual_gripper_state_array,
         dual_gripper_action_array,
     )
+
+
+def _shared_value_get(shared_value) -> float:
+    with shared_value.get_lock():
+        return float(shared_value.value)
+
+
+def _shared_value_jog(shared_value, delta: float, lo: float, hi: float) -> float:
+    with shared_value.get_lock():
+        next_value = float(np.clip(float(shared_value.value) + float(delta), lo, hi))
+        shared_value.value = next_value
+    return next_value
+
+
+def _state_to_inspire_cmd(value: float) -> float:
+    """Normalize JoySim Inspire state into the 0..1.2 command range when possible."""
+    value = float(value)
+    if abs(value) > 1.25:
+        return float(np.clip(value / 1000.0 * 1.2, 0.0, 1.2))
+    return float(np.clip(value, 0.0, 1.2))
+
+
+def _read_selected_gripper_state(
+    selected_arm: str,
+    dual_gripper_data_lock,
+    dual_gripper_state_array,
+) -> float | None:
+    if dual_gripper_data_lock is None or dual_gripper_state_array is None:
+        return None
+    with dual_gripper_data_lock:
+        idx = 0 if selected_arm == "left" else 1
+        return _state_to_inspire_cmd(float(dual_gripper_state_array[idx]))
+
+
+def _should_freeze_close_for_contact(
+    *,
+    args,
+    selected_arm: str,
+    gripper_contact_state: dict[str, tuple[float, float, float]],
+    now: float,
+    dual_gripper_data_lock,
+    dual_gripper_state_array,
+) -> bool:
+    if not bool(args.gripper_contact_hold):
+        return False
+    state = _read_selected_gripper_state(selected_arm, dual_gripper_data_lock, dual_gripper_state_array)
+    if state is None:
+        return False
+
+    if selected_arm not in gripper_contact_state:
+        gripper_contact_state[selected_arm] = (state, now, 0.0)
+        return False
+
+    prev_state, prev_t, stall_time = gripper_contact_state[selected_arm]
+    dt = max(1e-3, now - prev_t)
+    state_speed = abs((state - prev_state) / dt)
+    if state_speed <= float(args.gripper_contact_hold_speed_threshold):
+        stall_time += dt
+    else:
+        stall_time = 0.0
+    gripper_contact_state[selected_arm] = (state, now, stall_time)
+
+    # This is a contact proxy for sim runs without fingertip force sensors:
+    # while closing, stalled gripper motion usually means the fingertips have met
+    # either the object or each other. Stop jogging deeper and hold this input.
+    return stall_time >= float(args.gripper_contact_hold_min_duration)
 
 
 def _deadzone_vec(v: np.ndarray, dz: float) -> np.ndarray:
@@ -794,13 +890,40 @@ def build_arg_parser():
     parser.add_argument("--gripper-input-max", type=float, default=1.0)
     parser.add_argument("--gripper-open-input", type=float, default=1.0)
     parser.add_argument("--gripper-close-input", type=float, default=0.0)
-    # InspireDDS protocol endpoints (matches InspireDDS.isaac_output_range = (0.0, 1.2))
+    # InspireDDS protocol endpoints (matches InspireDDS.isaac_output_range = (0.0, 1.2)).
     #   open  = 0.0 -> JoySim mirror map drives joints to +-OMNIPICKER_GRIPPER_OPEN_RAD
-    #   close = 1.2 -> JoySim mirror map drives joints to 0 (fingertips meet)
+    #   close = 1.2 -> JoySim mirror map drives joints to 0 (fingertips meet).
+    # Keep the default close target short of full closure to avoid driving the
+    # fingertips through an object when no contact sensor is available.
     parser.add_argument("--inspire-gripper-open", type=float, default=0.0)
-    parser.add_argument("--inspire-gripper-close", type=float, default=1.2)
-    parser.add_argument("--inspire-gripper-alpha", type=float, default=0.2)
-    parser.add_argument("--inspire-gripper-max-speed", type=float, default=1.5)
+    parser.add_argument("--inspire-gripper-close", type=float, default=0.75)
+    parser.add_argument("--inspire-gripper-alpha", type=float, default=0.05)
+    parser.add_argument("--inspire-gripper-max-speed", type=float, default=0.20)
+    parser.add_argument(
+        "--gripper-jog-speed",
+        type=float,
+        default=0.20,
+        help="Gripper input change per second while holding BTN3/BTN4.",
+    )
+    parser.add_argument(
+        "--no-gripper-contact-hold",
+        dest="gripper_contact_hold",
+        action="store_false",
+        help="Disable the stall/contact proxy that stops deeper close jogging when the gripper stops moving.",
+    )
+    parser.set_defaults(gripper_contact_hold=True)
+    parser.add_argument(
+        "--gripper-contact-hold-speed-threshold",
+        type=float,
+        default=0.03,
+        help="Inspire-command units/s below which closing is treated as contact/stall.",
+    )
+    parser.add_argument(
+        "--gripper-contact-hold-min-duration",
+        type=float,
+        default=0.12,
+        help="Seconds of low gripper motion required before contact/stall hold freezes close jogging.",
+    )
     parser.add_argument("--go-home-on-exit", action="store_true", help="Send both arms home on exit")
     parser.add_argument(
         "--record-parquet",
@@ -921,7 +1044,10 @@ def main(argv=None):
             "Orientation mode: rx,ry,rz -> base-frame Rz(yaw)*Ry(pitch)*Rx(roll) "
             "(left-multiply, axes fixed to robot base)"
         )
-        logger_mp.info("Buttons: 1=left arm, 2=right arm | 3=open gripper, 4=close | mode=toggle pos/ori")
+        logger_mp.info(
+            "Buttons: 1=left arm, 2=right arm | hold 3=jog gripper open, hold 4=jog close | "
+            "mode=toggle pos/ori"
+        )
         logger_mp.info("Exit: Ctrl+C")
         if gripper_ctrl is not None:
             logger_mp.info(
@@ -931,11 +1057,22 @@ def main(argv=None):
                 float(args.gripper_close_input),
                 float(args.inspire_gripper_close),
             )
+            logger_mp.info(
+                "Gripper jog: %.3f input/s, contact-hold=%s (stall speed <= %.3f Inspire cmd/s for %.2fs)",
+                float(args.gripper_jog_speed),
+                "on" if bool(args.gripper_contact_hold) else "off",
+                float(args.gripper_contact_hold_speed_threshold),
+                float(args.gripper_contact_hold_min_duration),
+            )
         logger_mp.info("-------------------------------------------------------------")
 
         last_print_t = 0.0
         open_input = float(args.gripper_open_input)
         close_input = float(args.gripper_close_input)
+        gripper_input_lo = min(open_input, close_input)
+        gripper_input_hi = max(open_input, close_input)
+        open_sign = 1.0 if open_input >= close_input else -1.0
+        gripper_contact_state: dict[str, tuple[float, float, float]] = {}
         last_raw_buttons = -1
 
         while not stop_evt.is_set():
@@ -1015,25 +1152,61 @@ def main(argv=None):
                 right_target_tf[2, 3] = np.clip(right_target_tf[2, 3], args.workspace_limit_z[0], args.workspace_limit_z[1])
 
             if gripper_ctrl is not None:
-                # Latching behavior: button press updates target once and keeps it.
-                if edges & BTN_3:
-                    if selected_arm == "left":
-                        with left_gripper_value.get_lock():
-                            left_gripper_value.value = open_input
-                    else:
-                        with right_gripper_value.get_lock():
-                            right_gripper_value.value = open_input
-                    logger_mp.info("[spacemouse] BTN3 pressed, gripper OPEN (%s)", selected_arm)
+                target_gripper_value = left_gripper_value if selected_arm == "left" else right_gripper_value
+                jog_step = max(0.0, float(args.gripper_jog_speed)) / max(1.0, float(args.frequency))
+                open_pressed = bool(raw_buttons & BTN_3)
+                close_pressed = bool(raw_buttons & BTN_4)
 
-                if edges & BTN_4:
-                    if selected_arm == "left":
-                        with left_gripper_value.get_lock():
-                            left_gripper_value.value = close_input
+                if open_pressed and not close_pressed:
+                    _shared_value_jog(
+                        target_gripper_value,
+                        open_sign * jog_step,
+                        gripper_input_lo,
+                        gripper_input_hi,
+                    )
+                    if edges & BTN_3:
+                        logger_mp.info("[spacemouse] BTN3 held, gripper jog OPEN (%s)", selected_arm)
+                    gripper_contact_state[selected_arm] = (
+                        _read_selected_gripper_state(selected_arm, dual_gripper_data_lock, dual_gripper_state_array)
+                        or 0.0,
+                        tick_t0,
+                        0.0,
+                    )
+                elif close_pressed and not open_pressed:
+                    if _should_freeze_close_for_contact(
+                        args=args,
+                        selected_arm=selected_arm,
+                        gripper_contact_state=gripper_contact_state,
+                        now=tick_t0,
+                        dual_gripper_data_lock=dual_gripper_data_lock,
+                        dual_gripper_state_array=dual_gripper_state_array,
+                    ):
+                        next_input = _shared_value_get(target_gripper_value)
+                        if edges & BTN_4:
+                            logger_mp.info(
+                                "[spacemouse] BTN4 held, gripper contact/stall hold (%s, input=%.3f)",
+                                selected_arm,
+                                next_input,
+                            )
                     else:
-                        with right_gripper_value.get_lock():
-                            right_gripper_value.value = close_input
-                    logger_mp.info("[spacemouse] BTN4 pressed, gripper CLOSE (%s)", selected_arm)
-            elif edges & (BTN_3 | BTN_4):
+                        _shared_value_jog(
+                            target_gripper_value,
+                            -open_sign * jog_step,
+                            gripper_input_lo,
+                            gripper_input_hi,
+                        )
+                        if edges & BTN_4:
+                            logger_mp.info("[spacemouse] BTN4 held, gripper jog CLOSE (%s)", selected_arm)
+                elif open_pressed and close_pressed and edges & (BTN_3 | BTN_4):
+                    logger_mp.info("[spacemouse] BTN3+BTN4 held, gripper jog ignored (%s)", selected_arm)
+                elif edges & (BTN_3 | BTN_4):
+                    gripper_contact_state[selected_arm] = (
+                        _read_selected_gripper_state(selected_arm, dual_gripper_data_lock, dual_gripper_state_array)
+                        or 0.0,
+                        tick_t0,
+                        0.0,
+                    )
+            elif raw_buttons & (BTN_3 | BTN_4) or edges & (BTN_3 | BTN_4):
                 logger_mp.info(
                     "[spacemouse] BTN3/BTN4 ignored because gripper is disabled (--ee none). "
                     "Use --ee inspire_gripper or --ee dex1."
@@ -1048,11 +1221,30 @@ def main(argv=None):
                 sol_q = hold_q
                 sol_tauff = hold_tauff
             if recorder is not None:
+                left_gripper_input = right_gripper_input = None
+                left_gripper_action = right_gripper_action = None
+                left_gripper_state = right_gripper_state = None
+                if gripper_ctrl is not None:
+                    left_gripper_input = _shared_value_get(left_gripper_value)
+                    right_gripper_input = _shared_value_get(right_gripper_value)
+                    if dual_gripper_data_lock is not None and dual_gripper_state_array is not None:
+                        with dual_gripper_data_lock:
+                            left_gripper_state = float(dual_gripper_state_array[0])
+                            right_gripper_state = float(dual_gripper_state_array[1])
+                            if dual_gripper_action_array is not None:
+                                left_gripper_action = float(dual_gripper_action_array[0])
+                                right_gripper_action = float(dual_gripper_action_array[1])
                 recorder.record_command_tick(
                     t_ns=tick_t_ns,
                     ik_joint_pos=sol_q,
                     left_tf=left_target_tf,
                     right_tf=right_target_tf,
+                    left_gripper_input=left_gripper_input,
+                    right_gripper_input=right_gripper_input,
+                    left_gripper_action=left_gripper_action,
+                    right_gripper_action=right_gripper_action,
+                    left_gripper_state=left_gripper_state,
+                    right_gripper_state=right_gripper_state,
                 )
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
 

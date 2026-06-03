@@ -59,6 +59,7 @@ class Inspire_Gripper_Controller:
         close_cmd: float = 0.9,
         smooth_alpha: float = 0.2,
         max_speed: float = 1.5,
+        active_sides: tuple[str, ...] | None = None,
     ):
         logger_mp.info("Initialize Inspire_Gripper_Controller...")
         self.fps = float(fps)
@@ -72,6 +73,12 @@ class Inspire_Gripper_Controller:
         self.close_cmd = float(np.clip(close_cmd, 0.0, 1.2))
         self.smooth_alpha = float(np.clip(smooth_alpha, 0.0, 1.0))
         self.max_speed = float(max(0.0, max_speed))
+        if active_sides is None:
+            self.active_sides = ("left", "right")
+        else:
+            self.active_sides = tuple(side for side in active_sides if side in ("left", "right"))
+            if not self.active_sides:
+                self.active_sides = ("left", "right")
 
         self._state_filter = WeightedMovingFilter(np.array([0.5, 0.3, 0.2]), 2)
 
@@ -159,7 +166,10 @@ class Inspire_Gripper_Controller:
             # Keep shm payload minimal and compatible with JoySim InspireDDS:
             # {"positions": [...]} is treated as direct normalized command.
             # Extra keys (velocities/torques/kp/kd) may trigger XR remap path.
-            cmd_data = {"positions": [float(right_cmd)] * Inspire_Num_Motors + [float(left_cmd)] * Inspire_Num_Motors}
+            cmd_data = {
+                "positions": [float(right_cmd)] * Inspire_Num_Motors + [float(left_cmd)] * Inspire_Num_Motors,
+                "active_sides": list(self.active_sides),
+            }
             self.inspire_cmd_shm.write_data(cmd_data)
             return
 

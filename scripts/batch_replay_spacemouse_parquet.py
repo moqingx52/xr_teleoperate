@@ -131,10 +131,20 @@ def _run_one_replay(parquet_path: Path, args: argparse.Namespace) -> int:
             str(parquet_path),
             "--ee",
             str(args.ee),
+            "--gripper-sides",
+            str(args.gripper_sides),
             "--smooth-alpha",
             str(args.smooth_alpha),
             "--print-period",
             str(args.print_period),
+            "--inspire-gripper-open",
+            str(args.inspire_gripper_open),
+            "--inspire-gripper-close",
+            str(args.inspire_gripper_close),
+            "--inspire-gripper-alpha",
+            str(args.inspire_gripper_alpha),
+            "--inspire-gripper-max-speed",
+            str(args.inspire_gripper_max_speed),
         ]
         if args.hz > 0:
             cmd.extend(["--hz", str(args.hz)])
@@ -176,13 +186,28 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--network-interface", default=None)
     parser.add_argument("--ee", choices=["none", "inspire_gripper", "omnipicker"], default="inspire_gripper")
     parser.add_argument(
+        "--gripper-sides",
+        choices=["both", "left", "right"],
+        default="both",
+        help="Which OmniPicker gripper side should be actively driven during joint replay.",
+    )
+    parser.add_argument(
         "--replay-mode",
         choices=["joint", "ee_ik"],
         default="joint",
         help="joint uses command.ik_joint_pos directly; ee_ik replays command.eepose through teleop_omnipicker_and_arm.py --use-ik.",
     )
-    parser.add_argument("--hz", type=float, default=0.0)
+    parser.add_argument(
+        "--hz",
+        type=float,
+        default=0.0,
+        help="Fixed replay rate in Hz. 0 uses command.t_ns (required for HDF5 action/gripper alignment).",
+    )
     parser.add_argument("--smooth-alpha", type=float, default=0.25)
+    parser.add_argument("--inspire-gripper-open", type=float, default=0.0)
+    parser.add_argument("--inspire-gripper-close", type=float, default=1.2)
+    parser.add_argument("--inspire-gripper-alpha", type=float, default=1.0)
+    parser.add_argument("--inspire-gripper-max-speed", type=float, default=100.0)
     parser.add_argument("--print-period", type=float, default=0.5)
     parser.add_argument(
         "--settle-sec",
@@ -206,6 +231,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     if len(parquet_paths) == 0:
         print(f"[batch-replay] no parquet files found in {replay_dir} with pattern={args.glob!r}", flush=True)
         return 0
+
+    if float(args.hz) > 0.0:
+        print(
+            "[batch-replay][WARN] --hz > 0 replays commands faster than parquet command.t_ns; "
+            "HDF5 /action gripper may be wrong unless vla_hdf5_record command_index sync applies. "
+            "Prefer --hz 0 for HDF5 datasets.",
+            flush=True,
+        )
 
     shm = _wait_for_control_shm(
         name=str(args.ctl_shm_name),
