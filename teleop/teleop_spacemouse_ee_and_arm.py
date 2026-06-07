@@ -552,11 +552,23 @@ def _should_freeze_close_for_contact(
     now: float,
     dual_gripper_data_lock,
     dual_gripper_state_array,
+    dual_gripper_action_array,
 ) -> bool:
     if not bool(args.gripper_contact_hold):
         return False
     state = _read_selected_gripper_state(selected_arm, dual_gripper_data_lock, dual_gripper_state_array)
     if state is None:
+        return False
+
+    action = None
+    if dual_gripper_data_lock is not None and dual_gripper_action_array is not None:
+        idx = 0 if selected_arm == "left" else 1
+        with dual_gripper_data_lock:
+            action = _state_to_inspire_cmd(float(dual_gripper_action_array[idx]))
+    # While the command is still chasing the jogged input, low state speed is normal in sim
+    # (filtered feedback + joint lag) and must not be treated as contact/stall.
+    if action is not None and abs(action - state) > float(args.gripper_contact_hold_action_gap):
+        gripper_contact_state[selected_arm] = (state, now, 0.0)
         return False
 
     if selected_arm not in gripper_contact_state:
@@ -627,6 +639,30 @@ def _spacemouse_dR_base(
     roll_base_x = rot_scale * k[1] * rv[1]
     yaw_base_z = rot_scale * k[2] * rv[2]
     return _rot_z(yaw_base_z) @ _rot_y(pitch_base_y) @ _rot_x(roll_base_x)
+
+
+def _is_active_input(
+    tx: int,
+    ty: int,
+    tz: int,
+    rx: int,
+    ry: int,
+    rz: int,
+    raw_buttons: int,
+    edges: int,
+    trans_deadzone: float,
+    rot_deadzone: float,
+) -> bool:
+    if max(abs(tx), abs(ty), abs(tz)) > trans_deadzone:
+        return True
+    if max(abs(rx), abs(ry), abs(rz)) > rot_deadzone:
+        return True
+    btn_mask = BTN_1 | BTN_2 | BTN_3 | BTN_4 | BTN_MODE
+    if raw_buttons & btn_mask:
+        return True
+    if edges & btn_mask:
+        return True
+    return False
 
 
 class SpaceMouseHidState:
@@ -924,6 +960,15 @@ def build_arg_parser():
         default=0.12,
         help="Seconds of low gripper motion required before contact/stall hold freezes close jogging.",
     )
+    parser.add_argument(
+        "--gripper-contact-hold-action-gap",
+        type=float,
+        default=0.08,
+        help=(
+            "Do not treat motion as stalled while |action-state| exceeds this (Inspire cmd units). "
+            "Prevents early freeze when sim gripper feedback lags the command."
+        ),
+    )
     parser.add_argument("--go-home-on-exit", action="store_true", help="Send both arms home on exit")
     parser.add_argument(
         "--record-parquet",
@@ -947,6 +992,15 @@ def build_arg_parser():
         type=int,
         default=0,
         help="Optional periodic checkpoint write every N command ticks (0 disables periodic flush).",
+    )
+    parser.add_argument(
+        "--record-idle-pause",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When recording, skip command rows while SpaceMouse has no active input; "
+            "command.t_ns advances only on recorded frames (default: enabled)."
+        ),
     )
     return parser
 
@@ -1074,6 +1128,8 @@ def main(argv=None):
         open_sign = 1.0 if open_input >= close_input else -1.0
         gripper_contact_state: dict[str, tuple[float, float, float]] = {}
         last_raw_buttons = -1
+        record_t_ns: int | None = None
+        record_period_ns = int(round(1e9 / float(args.frequency)))
 
         while not stop_evt.is_set():
             tick_t0 = time.time()
@@ -1180,6 +1236,7 @@ def main(argv=None):
                         now=tick_t0,
                         dual_gripper_data_lock=dual_gripper_data_lock,
                         dual_gripper_state_array=dual_gripper_state_array,
+                        dual_gripper_action_array=dual_gripper_action_array,
                     ):
                         next_input = _shared_value_get(target_gripper_value)
                         if edges & BTN_4:
@@ -1220,7 +1277,30 @@ def main(argv=None):
             else:
                 sol_q = hold_q
                 sol_tauff = hold_tauff
-            if recorder is not None:
+            should_record = recorder is not None and (
+                not args.record_idle_pause
+                or _is_active_input(
+                    tx,
+                    ty,
+                    tz,
+                    rx,
+                    ry,
+                    rz,
+                    raw_buttons,
+                    edges,
+                    float(args.trans_deadzone),
+                    float(args.rot_deadzone),
+                )
+            )
+            if should_record:
+                if args.record_idle_pause:
+                    if record_t_ns is None:
+                        record_t_ns = tick_t_ns
+                    else:
+                        record_t_ns += record_period_ns
+                    command_t_ns = record_t_ns
+                else:
+                    command_t_ns = tick_t_ns
                 left_gripper_input = right_gripper_input = None
                 left_gripper_action = right_gripper_action = None
                 left_gripper_state = right_gripper_state = None
@@ -1235,7 +1315,7 @@ def main(argv=None):
                                 left_gripper_action = float(dual_gripper_action_array[0])
                                 right_gripper_action = float(dual_gripper_action_array[1])
                 recorder.record_command_tick(
-                    t_ns=tick_t_ns,
+                    t_ns=command_t_ns,
                     ik_joint_pos=sol_q,
                     left_tf=left_target_tf,
                     right_tf=right_target_tf,

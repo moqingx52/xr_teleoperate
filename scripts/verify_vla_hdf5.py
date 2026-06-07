@@ -15,8 +15,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 EXPECTED_IMAGES = {
     "head": (800, 1280, 3),
-    "left_wrist": (400, 848, 3),
-    "right_wrist": (400, 848, 3),
+    "left_wrist": (480, 848, 3),
+    "right_wrist": (480, 848, 3),
 }
 OPTIONAL_EE_POSE_KEY = "observations/ee_pose_base"
 

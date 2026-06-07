@@ -158,6 +158,54 @@ def _make_arm_controller(sim: bool, network_interface: str | None):
     return G1_29_ArmController(simulation_mode=sim)
 
 
+def _read_sim_step_from_arm_state(arm_ctrl) -> int | None:
+    shm = getattr(arm_ctrl, "lowstate_shm", None)
+    if shm is None:
+        return None
+    try:
+        payload = shm.read_data()
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("sim_step", None)
+    try:
+        return None if value is None else int(value)
+    except Exception:
+        return None
+
+
+def _wait_sim_step_available(arm_ctrl, timeout_sec: float = 30.0) -> int:
+    deadline = time.monotonic() + max(1.0, float(timeout_sec))
+    while time.monotonic() < deadline:
+        step = _read_sim_step_from_arm_state(arm_ctrl)
+        if step is not None:
+            return int(step)
+        time.sleep(0.01)
+    raise TimeoutError(
+        "Timed out waiting for sim_step in isaac_robot_state. "
+        "Restart JoySim with a DDSBridge that publishes sim_step."
+    )
+
+
+def _wait_until_sim_step(
+    arm_ctrl,
+    target_step: int,
+    *,
+    timeout_sec: float,
+) -> int:
+    deadline = time.monotonic() + max(1.0, float(timeout_sec))
+    last_step = None
+    while time.monotonic() < deadline:
+        step = _read_sim_step_from_arm_state(arm_ctrl)
+        if step is not None:
+            last_step = int(step)
+            if last_step >= int(target_step):
+                return last_step
+        time.sleep(0.002)
+    raise TimeoutError(f"Timed out waiting for sim_step>={target_step}; last_step={last_step}")
+
+
 def _make_gripper_controller(args: argparse.Namespace):
     if args.ee == "none":
         return None, None, None
@@ -203,16 +251,25 @@ def replay(data: ReplayData, args: argparse.Namespace) -> None:
     gripper_ctrl, left_gripper_value, right_gripper_value = _make_gripper_controller(args)
     del gripper_ctrl
 
+    sim_step_sync = bool(args.sim_step_sync and args.sim)
+    sim_steps_per_command = max(1, int(args.sim_steps_per_command))
+    sim_step_timeout_sec = max(1.0, float(args.sim_step_timeout_sec))
     hz = float(args.hz) if args.hz and args.hz > 0 else 0.0
     fixed_period = 1.0 / hz if hz > 0 else None
     start_wall = time.monotonic()
     first_t = float(data.command_t_ns[0])
     last_print = 0.0
+    next_target_step: int | None = None
+    if sim_step_sync:
+        base_step = _wait_sim_step_available(arm_ctrl, timeout_sec=sim_step_timeout_sec)
+        next_target_step = base_step
 
     try:
         for i, q in enumerate(data.joint_pos):
             loop_start = time.monotonic()
-            if fixed_period is None:
+            if sim_step_sync:
+                pass
+            elif fixed_period is None:
                 target_elapsed = max(0.0, (float(data.command_t_ns[i]) - first_t) / 1e9)
                 sleep_t = start_wall + target_elapsed - loop_start
                 if sleep_t > 0:
@@ -238,12 +295,24 @@ def replay(data: ReplayData, args: argparse.Namespace) -> None:
             arm_ctrl.ctrl_dual_arm(np.asarray(q, dtype=np.float64), np.zeros(14, dtype=np.float64))
             now = time.monotonic()
             if now - last_print >= float(args.print_period):
+                suffix = ""
+                if sim_step_sync and next_target_step is not None:
+                    suffix = f" sim_step_target={next_target_step + sim_steps_per_command}"
                 print(
                     f"frame={i + 1}/{len(data.joint_pos)} "
                     f"left_closed={data.left_closed[i]:.3f} right_closed={data.right_closed[i]:.3f}"
+                    f"{suffix}"
                 )
                 last_print = now
-            if fixed_period is not None:
+            if sim_step_sync:
+                assert next_target_step is not None
+                next_target_step += sim_steps_per_command
+                _wait_until_sim_step(
+                    arm_ctrl,
+                    next_target_step,
+                    timeout_sec=sim_step_timeout_sec,
+                )
+            elif fixed_period is not None:
                 elapsed = time.monotonic() - loop_start
                 time.sleep(max(0.0, fixed_period - elapsed))
     finally:
@@ -276,6 +345,26 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--inspire-gripper-alpha", type=float, default=0.05)
     parser.add_argument("--inspire-gripper-max-speed", type=float, default=0.20)
     parser.add_argument("--print-period", type=float, default=0.5)
+    parser.add_argument(
+        "--sim-step-sync",
+        action="store_true",
+        help=(
+            "In --sim mode, pace replay by isaac_robot_state['sim_step'] instead of wall time. "
+            "Use this for offline rendering when Isaac runs slower than real time."
+        ),
+    )
+    parser.add_argument(
+        "--sim-steps-per-command",
+        type=int,
+        default=4,
+        help="Number of JoySim 120Hz simulation steps to hold each 30Hz parquet command when --sim-step-sync is enabled.",
+    )
+    parser.add_argument(
+        "--sim-step-timeout-sec",
+        type=float,
+        default=120.0,
+        help="Timeout while waiting for simulation steps in --sim-step-sync mode.",
+    )
     parser.add_argument("--go-home-on-exit", action="store_true")
     return parser.parse_args(argv)
 

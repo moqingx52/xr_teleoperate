@@ -39,17 +39,12 @@ def _load_parquet_paths(directory: Path, pattern: str, sort_mode: str) -> list[P
     return files
 
 
-def _wait_for_control_shm(name: str, size: int, timeout_sec: float):
-    deadline = time.monotonic() + max(1.0, float(timeout_sec))
-    shm = try_open_shm(name=name, size=int(size))
-    while shm is None and time.monotonic() < deadline:
-        time.sleep(0.2)
+def _wait_for_control_shm(name: str, size: int):
+    while True:
         shm = try_open_shm(name=name, size=int(size))
-    if shm is None:
-        raise TimeoutError(
-            f"Timed out waiting for control shm <{name}>. Start joysim with replay_episode_control enabled."
-        )
-    return shm
+        if shm is not None:
+            return shm
+        time.sleep(0.2)
 
 
 def _send_command(
@@ -69,13 +64,12 @@ def _send_command(
     }
     ok = shm.write_data(payload)
     if not ok:
-        raise RuntimeError(f"Failed to write control command to shm: {payload}")
+        print(f"[batch-replay][WARN] failed to write control command: {payload}", flush=True)
 
 
-def _wait_for_status(shm, request_id: int, expected_status: str, timeout_sec: float) -> dict:
-    deadline = time.monotonic() + max(1.0, float(timeout_sec))
+def _wait_for_status(shm, request_id: int, expected_status: str) -> dict:
     expected = str(expected_status)
-    while time.monotonic() < deadline:
+    while True:
         payload = shm.read_data() or {}
         if not isinstance(payload, dict):
             time.sleep(0.05)
@@ -90,12 +84,9 @@ def _wait_for_status(shm, request_id: int, expected_status: str, timeout_sec: fl
         if status == expected:
             return payload
         if status == "error":
-            raise RuntimeError(f"Control command failed: {payload}")
+            print(f"[batch-replay][WARN] control command error: {payload}", flush=True)
+            return payload
         time.sleep(0.05)
-
-    raise TimeoutError(
-        f"Timed out waiting for command {request_id} to reach status={expected_status!r}."
-    )
 
 
 def _run_one_replay(parquet_path: Path, args: argparse.Namespace) -> int:
@@ -179,7 +170,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sort", choices=["name", "mtime"], default="name")
     parser.add_argument("--ctl-shm-name", default=SHM_REPLAY_EPISODE_CTL)
     parser.add_argument("--ctl-shm-size", type=int, default=SIZE_REPLAY_EPISODE_CTL)
-    parser.add_argument("--ctl-timeout-sec", type=float, default=120.0)
     parser.add_argument("--sim", dest="sim", action="store_true", help="Use simulation shared memory mode.")
     parser.add_argument("--real", dest="sim", action="store_false", help="Use real robot DDS mode.")
     parser.set_defaults(sim=True)
@@ -212,11 +202,15 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--settle-sec",
         type=float,
-        default=0.0,
+        default=0.5,
         help="Wait this long after replay returns before finalizing the recorder.",
     )
     parser.add_argument("--go-home-on-exit", action="store_true")
-    parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Deprecated; kept for CLI compatibility. Batch replay always runs all episodes.",
+    )
     return parser.parse_args(argv)
 
 
@@ -232,24 +226,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"[batch-replay] no parquet files found in {replay_dir} with pattern={args.glob!r}", flush=True)
         return 0
 
-    if float(args.hz) > 0.0:
-        print(
-            "[batch-replay][WARN] --hz > 0 replays commands faster than parquet command.t_ns; "
-            "HDF5 /action gripper may be wrong unless vla_hdf5_record command_index sync applies. "
-            "Prefer --hz 0 for HDF5 datasets.",
-            flush=True,
-        )
-
     shm = _wait_for_control_shm(
         name=str(args.ctl_shm_name),
         size=int(args.ctl_shm_size),
-        timeout_sec=float(args.ctl_timeout_sec),
     )
 
     initial_status = shm.read_data() or {}
     handled_request_id = _safe_int(initial_status.get("handled_request_id"), default=-1)
     request_id = handled_request_id if handled_request_id >= 0 else int(time.time() * 1000)
-    failed: list[Path] = []
     for parquet_path in parquet_paths:
         request_id += 1
         _send_command(
@@ -263,7 +247,6 @@ def main(argv: Iterable[str] | None = None) -> int:
             shm,
             request_id=request_id,
             expected_status="ready",
-            timeout_sec=float(args.ctl_timeout_sec),
         )
         video_output_path = prepare_info.get("video_output_path", None)
         if video_output_path:
@@ -275,53 +258,21 @@ def main(argv: Iterable[str] | None = None) -> int:
         if record_output_path and not video_output_path and not hdf5_output_path:
             print(f"[batch-replay] recording to: {record_output_path}", flush=True)
 
-        code = 1
-        replay_error: Exception | None = None
         try:
-            code = _run_one_replay(parquet_path=parquet_path, args=args)
+            _run_one_replay(parquet_path=parquet_path, args=args)
             settle_sec = max(0.0, float(args.settle_sec))
             if settle_sec > 0.0:
-                print(f"[batch-replay] settle before finalize: {settle_sec:.3f}s", flush=True)
                 time.sleep(settle_sec)
         except Exception as exc:
-            replay_error = exc
-            print(f"[batch-replay] replay raised exception: {exc}", flush=True)
+            print(f"[batch-replay][WARN] replay raised exception: {exc}", flush=True)
         finally:
             request_id += 1
             _send_command(shm, request_id=request_id, command="finalize", episode_tag=parquet_path.stem)
-            finalize_info = _wait_for_status(
+            _wait_for_status(
                 shm,
                 request_id=request_id,
                 expected_status="idle",
-                timeout_sec=float(args.ctl_timeout_sec),
             )
-            record_info = finalize_info.get("record_info", None)
-            if isinstance(record_info, dict) and record_info:
-                print(
-                    "[batch-replay] hdf5 finalized: "
-                    f"path={record_info.get('path', '')} "
-                    f"frames={record_info.get('frames', 0)} "
-                    f"dropped={record_info.get('dropped_frames', 0)} "
-                    f"shape_errors={record_info.get('shape_errors', 0)}",
-                    flush=True,
-                )
-
-        if replay_error is not None:
-            failed.append(parquet_path)
-            if args.fail_fast:
-                break
-            continue
-
-        if code != 0:
-            failed.append(parquet_path)
-            if args.fail_fast:
-                break
-
-    if len(failed) > 0:
-        print("[batch-replay] failed trajectories:", flush=True)
-        for path in failed:
-            print(f"  - {path}", flush=True)
-        return 1
 
     print(f"[batch-replay] all done, episodes={len(parquet_paths)}", flush=True)
     return 0

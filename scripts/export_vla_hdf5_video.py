@@ -249,7 +249,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Render using /timestamps as real-time axis (resample at output fps, ZOH hold).",
     )
-    parser.add_argument("--target-height", type=int, default=400, help="Height used for each view in the combined video.")
+    parser.add_argument("--target-height", type=int, default=480, help="Height used for each view in the combined video.")
     parser.add_argument("--individual", action="store_true", help="Also export one MP4 per camera.")
     parser.add_argument(
         "--no-x264",
