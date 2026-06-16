@@ -175,8 +175,8 @@ def hands_to_pot_trajectory(
 
 
 # Fixed dual-hand offset from pot center in world frame (±Y lateral, +Z up).
-FIXED_GRASP_LATERAL_OFFSET_M = 0.05
-FIXED_GRASP_UP_OFFSET_M = 0.02
+FIXED_GRASP_LATERAL_OFFSET_M = 0.04
+FIXED_GRASP_UP_OFFSET_M =  0.0
 
 
 def grasp_locals_from_fixed_world_offsets(
@@ -206,6 +206,7 @@ def grasp_locals_from_fixed_world_offsets(
     lateral = float(lateral_offset_m)
     up = float(up_offset_m)
     left_world = pot_pos + np.array([0.0, -lateral, up], dtype=np.float64)
+    # right_world = pot_pos + np.array([0.0, lateral, up], dtype=np.float64)
     right_world = pot_pos + np.array([0.0, lateral, up], dtype=np.float64)
     left_local = rot.T @ (left_world - pot_pos)
     right_local = rot.T @ (right_world - pot_pos)

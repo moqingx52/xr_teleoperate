@@ -1,4 +1,5 @@
 import casadi                                                                       
+from dataclasses import dataclass
 import meshcat.geometry as mg
 import numpy as np
 import pinocchio as pin                             
@@ -23,6 +24,178 @@ def homogeneous_from_position_rotation(p_ee_target, R_ee_target):
     T[:3, :3] = np.asarray(R_ee_target, dtype=np.float64).reshape(3, 3)
     T[:3, 3] = np.asarray(p_ee_target, dtype=np.float64).reshape(3)
     return T
+
+
+@dataclass
+class IKResult:
+    success: bool
+    q: np.ndarray
+    position_error: float
+    rotation_error: float
+    iterations: int
+    mode: str
+
+
+class _SingleArmPrecisionIK:
+    """Task-priority Pinocchio DLS IK over one 7-DoF arm inside a dual-arm model."""
+
+    def __init__(
+        self,
+        model: pin.Model,
+        frame_id: int,
+        active_joint_names: list,
+        side: str,
+    ):
+        self.model = model
+        self.data = model.createData()
+        self.frame_id = frame_id
+        self.side = side
+        self.active_joint_names = list(active_joint_names)
+        self.active_q_indices = np.array(
+            [int(model.idx_qs[model.getJointId(name)]) for name in self.active_joint_names],
+            dtype=np.int64,
+        )
+        self.q_lb = np.asarray(model.lowerPositionLimit, dtype=np.float64)[self.active_q_indices]
+        self.q_ub = np.asarray(model.upperPositionLimit, dtype=np.float64)[self.active_q_indices]
+        self.q_mid = 0.5 * (self.q_lb + self.q_ub)
+        self.q_half_range = np.maximum(0.5 * (self.q_ub - self.q_lb), 1e-6)
+
+        self.position_tolerance = 5e-4
+        self.rotation_tolerance = np.deg2rad(0.2)
+        self.sigma_position = 1e-3
+        self.sigma_rotation = np.deg2rad(0.5)
+        self.W_task = np.diag(
+            [1.0 / self.sigma_position] * 3 + [1.0 / self.sigma_rotation] * 3
+        )
+        self.W_joint = np.eye(len(self.active_q_indices))
+        self.max_iterations = 80
+        self.max_iteration_step = 0.20
+        self.rank_tolerance = 1e-6
+        self.sigma_safe = 0.05
+        self.k_continuity = 0.02
+        self.k_joint_limit = 0.01
+        self.min_line_search_alpha = 1e-3
+        self.previous_valid_q = np.clip(self.q_mid.copy(), self.q_lb, self.q_ub)
+
+    def q_from_full(self, q_full: np.ndarray) -> np.ndarray:
+        return np.asarray(q_full, dtype=np.float64)[self.active_q_indices].copy()
+
+    def put_q(self, q_full: np.ndarray, q_arm: np.ndarray) -> np.ndarray:
+        out = np.asarray(q_full, dtype=np.float64).copy()
+        out[self.active_q_indices] = np.asarray(q_arm, dtype=np.float64)
+        return out
+
+    def _compute_pose(self, q_full: np.ndarray) -> pin.SE3:
+        pin.forwardKinematics(self.model, self.data, q_full)
+        pin.updateFramePlacements(self.model, self.data)
+        return self.data.oMf[self.frame_id]
+
+    def _pose_errors(self, current: pin.SE3, target: pin.SE3):
+        position_error = float(np.linalg.norm(current.translation - target.translation))
+        rotation_error = float(np.linalg.norm(pin.log3(current.rotation.T @ target.rotation)))
+        return position_error, rotation_error
+
+    def _normalized_error_norm(self, q_full: np.ndarray, target: pin.SE3) -> float:
+        current = self._compute_pose(q_full)
+        error6 = pin.log6(current.actInv(target)).vector
+        return float(np.linalg.norm(self.W_task @ error6))
+
+    def _compute_damping(self, singular_values: np.ndarray) -> float:
+        sigma_min = float(np.min(singular_values)) if singular_values.size else 0.0
+        if sigma_min > self.sigma_safe:
+            return 1e-4
+        ratio = np.clip(sigma_min / self.sigma_safe, 0.0, 1.0)
+        return float(1e-4 + (1.0 - ratio) ** 2 * 0.1)
+
+    def _joint_limit_gradient(self, q: np.ndarray) -> np.ndarray:
+        normalized = (q - self.q_mid) / self.q_half_range
+        return normalized / self.q_half_range
+
+    def _backtracking_update(
+        self,
+        q: np.ndarray,
+        dq: np.ndarray,
+        q_full_template: np.ndarray,
+        target: pin.SE3,
+        current_score: float,
+    ):
+        alpha = 1.0
+        while alpha >= self.min_line_search_alpha:
+            candidate = np.clip(q + alpha * dq, self.q_lb, self.q_ub)
+            score = self._normalized_error_norm(self.put_q(q_full_template, candidate), target)
+            if np.isfinite(score) and score < current_score:
+                return candidate
+            alpha *= 0.5
+        return None
+
+    def make_failure_result(self, q: np.ndarray, q_full_template: np.ndarray, target: pin.SE3, iterations: int) -> IKResult:
+        current = self._compute_pose(self.put_q(q_full_template, q))
+        position_error, rotation_error = self._pose_errors(current, target)
+        return IKResult(False, q, position_error, rotation_error, iterations, "local_failed")
+
+    def solve_local(self, target: pin.SE3, q_full_seed: np.ndarray) -> IKResult:
+        q = np.clip(self.q_from_full(q_full_seed), self.q_lb, self.q_ub)
+        q_anchor = self.previous_valid_q.copy()
+        q_full_template = np.asarray(q_full_seed, dtype=np.float64).copy()
+
+        for iteration in range(self.max_iterations):
+            q_full = self.put_q(q_full_template, q)
+            current = self._compute_pose(q_full)
+            current_to_target = current.actInv(target)
+            error6 = pin.log6(current_to_target).vector
+            position_error, rotation_error = self._pose_errors(current, target)
+            if position_error < self.position_tolerance and rotation_error < self.rotation_tolerance:
+                self.previous_valid_q = q.copy()
+                return IKResult(True, q, position_error, rotation_error, iteration, "local")
+
+            J_frame = pin.computeFrameJacobian(
+                self.model,
+                self.data,
+                q_full,
+                self.frame_id,
+                pin.LOCAL,
+            )[:, self.active_q_indices]
+            J_error = -pin.Jlog6(current_to_target.inverse()) @ J_frame
+            error_normalized = self.W_task @ error6
+            J_normalized = self.W_task @ J_error
+
+            try:
+                U, singular_values, Vt = np.linalg.svd(J_normalized, full_matrices=True)
+            except np.linalg.LinAlgError:
+                break
+            V = Vt.T
+            damping = self._compute_damping(singular_values)
+            J_damped_inverse = (
+                V[:, : singular_values.size]
+                @ np.diag(singular_values / (singular_values**2 + damping**2))
+                @ U.T
+            )
+            dq_task = -J_damped_inverse @ error_normalized
+
+            rank = int(np.count_nonzero(singular_values > self.rank_tolerance))
+            Z = V[:, rank:]
+            N = Z @ Z.T if Z.size else np.zeros((q.size, q.size), dtype=np.float64)
+            grad_continuity = self.W_joint @ (q - q_anchor)
+            grad_limit = self._joint_limit_gradient(q)
+            dq_secondary = -N @ (self.k_continuity * grad_continuity + self.k_joint_limit * grad_limit)
+            dq = np.clip(dq_task + dq_secondary, -self.max_iteration_step, self.max_iteration_step)
+
+            current_score = float(np.linalg.norm(error_normalized))
+            accepted = self._backtracking_update(q, dq, q_full_template, target, current_score)
+            if accepted is None and np.linalg.norm(dq_secondary) > 0.0:
+                dq_task_clipped = np.clip(dq_task, -self.max_iteration_step, self.max_iteration_step)
+                accepted = self._backtracking_update(q, dq_task_clipped, q_full_template, target, current_score)
+            if accepted is None:
+                dq_gradient = -(J_normalized.T @ error_normalized)
+                dq_gradient_norm = float(np.linalg.norm(dq_gradient, ord=np.inf))
+                if dq_gradient_norm > 1e-12:
+                    dq_gradient = dq_gradient / dq_gradient_norm * self.max_iteration_step
+                    accepted = self._backtracking_update(q, dq_gradient, q_full_template, target, current_score)
+            if accepted is None:
+                break
+            q = accepted
+
+        return self.make_failure_result(q, q_full_template, target, iteration + 1)
 
 
 class G1_29_ArmIK:
@@ -199,6 +372,7 @@ class G1_29_ArmIK:
         else:
             self.L_hand_id = self.reduced_robot.model.getFrameId("L_ee")
             self.R_hand_id = self.reduced_robot.model.getFrameId("R_ee")
+        self._setup_precision_ik()
 
         self.translational_error = casadi.Function(
             "translational_error",
@@ -284,6 +458,7 @@ class G1_29_ArmIK:
         else:
             self.L_hand_id = self.reduced_robot.model.getFrameId("L_ee")
             self.R_hand_id = self.reduced_robot.model.getFrameId("R_ee")
+        self._setup_precision_ik()
 
         self.translational_error = casadi.Function(
             "translational_error",
@@ -385,6 +560,40 @@ class G1_29_ArmIK:
                     )
                 )
 
+    def _setup_precision_ik(self):
+        self.enable_precision_ik = bool(getattr(self, "enable_precision_ik", True))
+        self._precision_ik_ready = False
+        self.left_precision_ik = None
+        self.right_precision_ik = None
+        if not getattr(self, "_use_a2d_omnipicker_urdf", False):
+            return
+        left_joint_names = [
+            "Joint1_l", "Joint2_l", "Joint3_l", "Joint4_l", "Joint5_l", "Joint6_l", "Joint7_l",
+        ]
+        right_joint_names = [
+            "Joint1_r", "Joint2_r", "Joint3_r", "Joint4_r", "Joint5_r", "Joint6_r", "Joint7_r",
+        ]
+        try:
+            self.left_precision_ik = _SingleArmPrecisionIK(
+                self.reduced_robot.model,
+                self.L_hand_id,
+                left_joint_names,
+                "left",
+            )
+            self.right_precision_ik = _SingleArmPrecisionIK(
+                self.reduced_robot.model,
+                self.R_hand_id,
+                right_joint_names,
+                "right",
+            )
+            self._precision_ik_ready = True
+            self.enable_joint_smoothing = False
+            logger_mp.info("[G1_29_ArmIK] precision single-arm Pinocchio IK enabled.")
+        except Exception as exc:
+            logger_mp.warning(
+                f"[G1_29_ArmIK] precision IK unavailable, using IPOPT fallback: {type(exc).__name__}: {exc}"
+            )
+
     # Save both robot.model and reduced_robot.model
     def save_cache(self):
         data = {
@@ -427,13 +636,76 @@ class G1_29_ArmIK:
         current_lr_arm_motor_dq,
         other_wrist_4x4: np.ndarray,
     ):
-        """单侧末端位姿 + 对侧齐次矩阵，内部仍走双臂 solve_ik。"""
+        """单侧末端位姿 + 对侧齐次矩阵，保持外部接口兼容。"""
         T = homogeneous_from_position_rotation(p_ee_target, R_ee_target)
         if str(side).lower() == "left":
             return self.solve_ik(T, other_wrist_4x4, current_lr_arm_motor_q, current_lr_arm_motor_dq)
         return self.solve_ik(other_wrist_4x4, T, current_lr_arm_motor_q, current_lr_arm_motor_dq)
 
-    def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
+    def _target_from_matrix(self, wrist: np.ndarray) -> pin.SE3:
+        wrist = np.asarray(wrist, dtype=np.float64)
+        return pin.SE3(wrist[:3, :3], wrist[:3, 3])
+
+    def _solve_ik_precision(self, left_wrist, right_wrist, current_lr_arm_motor_q=None, current_lr_arm_motor_dq=None):
+        if current_lr_arm_motor_q is not None:
+            seed_q = np.asarray(current_lr_arm_motor_q, dtype=np.float64).copy()
+        else:
+            seed_q = np.asarray(self.init_data, dtype=np.float64).copy()
+
+        left_target = self._target_from_matrix(left_wrist)
+        right_target = self._target_from_matrix(right_wrist)
+        left_result = self.left_precision_ik.solve_local(left_target, seed_q)
+        q_after_left = self.left_precision_ik.put_q(seed_q, left_result.q)
+        right_result = self.right_precision_ik.solve_local(right_target, q_after_left)
+
+        if not (left_result.success and right_result.success):
+            logger_mp.warning(
+                "[G1_29_ArmIK] precision IK failed, falling back to IPOPT. "
+                f"left=({left_result.mode}, p={left_result.position_error:.6g}, "
+                f"r={left_result.rotation_error:.6g}, it={left_result.iterations}) "
+                f"right=({right_result.mode}, p={right_result.position_error:.6g}, "
+                f"r={right_result.rotation_error:.6g}, it={right_result.iterations})"
+            )
+            return self._solve_ik_ipopt(left_wrist, right_wrist, current_lr_arm_motor_q, current_lr_arm_motor_dq)
+
+        sol_q = self.right_precision_ik.put_q(q_after_left, right_result.q)
+        sol_q = np.clip(
+            sol_q,
+            np.asarray(self.reduced_robot.model.lowerPositionLimit, dtype=np.float64),
+            np.asarray(self.reduced_robot.model.upperPositionLimit, dtype=np.float64),
+        )
+        if current_lr_arm_motor_dq is not None:
+            v = np.asarray(current_lr_arm_motor_dq, dtype=np.float64) * 0.0
+        else:
+            v = (sol_q - seed_q) * 0.0
+        self.init_data = sol_q.copy()
+        sol_tauff = pin.rnea(
+            self.reduced_robot.model,
+            self.reduced_robot.data,
+            sol_q,
+            v,
+            np.zeros(self.reduced_robot.model.nv),
+        )
+        if self.Visualization:
+            self.vis.viewer['L_ee_target'].set_transform(left_wrist)
+            self.vis.viewer['R_ee_target'].set_transform(right_wrist)
+            self.vis.display(sol_q)
+        return sol_q, sol_tauff
+
+    def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q=None, current_lr_arm_motor_dq=None):
+        if (
+            getattr(self, "enable_precision_ik", True)
+            and getattr(self, "_precision_ik_ready", False)
+        ):
+            return self._solve_ik_precision(
+                left_wrist,
+                right_wrist,
+                current_lr_arm_motor_q,
+                current_lr_arm_motor_dq,
+            )
+        return self._solve_ik_ipopt(left_wrist, right_wrist, current_lr_arm_motor_q, current_lr_arm_motor_dq)
+
+    def _solve_ik_ipopt(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
         if current_lr_arm_motor_q is not None:
             self.init_data = current_lr_arm_motor_q
         self.opti.set_initial(self.var_q, self.init_data)

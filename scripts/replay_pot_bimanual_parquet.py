@@ -48,6 +48,7 @@ from teleop.utils.pot_retarget import (  # noqa: E402
     grasp_locals_from_fixed_world_offsets,
 )
 from teleop.utils.pot_trajectory_clean import clean_pot_trajectory  # noqa: E402
+from teleop.utils.pot_trajectory_smooth import smooth_pot_trajectory  # noqa: E402
 
 
 def _as_arr(v: object, n: int, name: str) -> np.ndarray:
@@ -122,6 +123,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pot-shm-size", type=int, default=4096)
     parser.add_argument("--robot-base-pos-world", nargs=3, type=float, default=(0.0, 0.4, 0.0))
     parser.add_argument("--robot-base-quat-world-wxyz", nargs=4, type=float, default=(0.0, 0.0, 0.0, 1.0))
+    parser.add_argument(
+        "--ik-base-pos-world",
+        nargs=3,
+        type=float,
+        default=None,
+        help="World position of the xr_teleoperate IK base. Defaults to --robot-base-pos-world.",
+    )
+    parser.add_argument(
+        "--ik-base-quat-world-wxyz",
+        nargs=4,
+        type=float,
+        default=None,
+        help="World quaternion of the xr_teleoperate IK base. Defaults to --robot-base-quat-world-wxyz.",
+    )
     parser.add_argument("--pot-frame", choices=("robot_base", "world"), default="robot_base")
     parser.add_argument("--align-to-scene-pot", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--align-to-scene-target", action=argparse.BooleanOptionalAction, default=True)
@@ -142,6 +157,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clean-trajectory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--jump-thresh-m", type=float, default=0.05)
     parser.add_argument("--tail-speed-thresh-m", type=float, default=0.03)
+    parser.add_argument(
+        "--smooth-method",
+        choices=("none", "kalman", "ema"),
+        default="none",
+        help="Temporal smoothing on pot pose after outlier clean (kalman recommended for jitter).",
+    )
+    parser.add_argument("--smooth-pos-alpha", type=float, default=0.25, help="EMA alpha when --smooth-method=ema.")
+    parser.add_argument("--smooth-quat-alpha", type=float, default=0.3, help="Slerp EMA alpha for pot orientation.")
+    parser.add_argument("--smooth-meas-noise", type=float, default=2.5e-5, help="Kalman measurement noise (m^2).")
+    parser.add_argument("--smooth-process-noise-pos", type=float, default=1e-5)
+    parser.add_argument("--smooth-process-noise-vel", type=float, default=5e-3)
     parser.add_argument("--gripper-open-input", type=float, default=1.0)
     parser.add_argument("--gripper-close-input", type=float, default=0.0)
     parser.add_argument("--print-period", type=float, default=0.5)
@@ -335,21 +361,35 @@ def _hands_from_pot_trajectory(
     return left_pos, left_quat, right_pos, right_quat
 
 
-def main() -> int:
-    args = parse_args()
-    mode = str(args.mode)
-    fixed_grasp_offsets = bool(args.fixed_grasp_offsets) and mode == "pot_ik"
-    path = Path(args.input).expanduser().resolve()
-    df = _load(path, mode=mode, require_hand_columns=not fixed_grasp_offsets)
-
-    pot_shm = try_open_shm(name=str(args.pot_shm_name), size=int(args.pot_shm_size))
-    if pot_shm is None:
-        raise RuntimeError(f"Failed to open pot shm: {args.pot_shm_name}")
-
-    base_pos = np.asarray(args.robot_base_pos_world, dtype=np.float64)
-    base_quat_wxyz = np.asarray(args.robot_base_quat_world_wxyz, dtype=np.float64)
-    pot_frame = str(args.pot_frame)
-
+def build_pot_replay_world_targets(
+    df: pd.DataFrame,
+    *,
+    mode: str,
+    fixed_grasp_offsets: bool,
+    base_pos: np.ndarray,
+    base_quat_wxyz: np.ndarray,
+    pot_frame: str,
+    align_to_scene_pot: bool,
+    scene_pot_pos_w: np.ndarray | None,
+    scene_pot_quat_w: np.ndarray | None,
+    start_z_offset_m: float,
+    align_to_scene_target: bool,
+    scene_target_pos_w: np.ndarray | None,
+    target_z_offset_m: float,
+    clamp_z_to_start_enabled: bool,
+    clean_trajectory: bool,
+    jump_thresh_m: float,
+    tail_speed_thresh_m: float,
+    smooth_method: str,
+    smooth_pos_alpha: float,
+    smooth_quat_alpha: float,
+    smooth_meas_noise: float,
+    smooth_process_noise_pos: float,
+    smooth_process_noise_vel: float,
+    grasp_y_half_span_scale: float,
+    grasp_z_offset_m: float,
+) -> dict[str, object]:
+    """Build the exact world-frame pot and hand targets used by replay."""
     pos_world, quat_world, times = _build_pot_world_arrays(
         df,
         base_pos=base_pos,
@@ -357,23 +397,33 @@ def main() -> int:
         pot_frame=pot_frame,
     )
 
-    if bool(args.clean_trajectory):
-        keep, summary = clean_pot_trajectory(
+    clean_summary = None
+    if bool(clean_trajectory):
+        keep, clean_summary = clean_pot_trajectory(
             pos_world,
             quat_world,
             times,
-            jump_thresh_floor=float(args.jump_thresh_m),
-            tail_speed_thresh=float(args.tail_speed_thresh_m),
+            jump_thresh_floor=float(jump_thresh_m),
+            tail_speed_thresh=float(tail_speed_thresh_m),
         )
         df = df.iloc[keep].reset_index(drop=True)
         pos_world = pos_world[keep]
         quat_world = quat_world[keep]
-        print(
-            f"[clean] frames={summary['frames_in']}->{summary['frames_out']} "
-            f"removed_outlier={summary['removed_outlier']} "
-            f"removed_tail={summary['removed_tail']} "
-            f"tail_cut_index={summary['tail_cut_index']}",
-            flush=True,
+        if times is not None:
+            times = times[keep]
+
+    smooth_method_norm = str(smooth_method).strip().lower()
+    if smooth_method_norm not in ("none", "off", ""):
+        pos_world, quat_world = smooth_pot_trajectory(
+            pos_world,
+            quat_world,
+            times,
+            method=smooth_method_norm,
+            pos_alpha=float(smooth_pos_alpha),
+            quat_alpha=float(smooth_quat_alpha),
+            process_noise_pos=float(smooth_process_noise_pos),
+            process_noise_vel=float(smooth_process_noise_vel),
+            measurement_noise=float(smooth_meas_noise),
         )
 
     left_pos_w = left_quat_w = right_pos_w = right_quat_w = None
@@ -386,60 +436,43 @@ def main() -> int:
         )
 
     T_align = np.eye(4, dtype=np.float64)
-    end_target = None
-    scene_pos_w = None
-    scene_quat_w = None
     scene_start_pos = None
-    if bool(args.align_to_scene_pot):
-        scene_pos_w, scene_quat_w = wait_scene_pot_pose(
-            pot_shm,
-            timeout_sec=float(args.align_timeout_sec),
+    if bool(align_to_scene_pot):
+        if scene_pot_pos_w is None:
+            scene_pot_pos_w = pos_world[0]
+        if scene_pot_quat_w is None:
+            scene_pot_quat_w = quat_world[0]
+        scene_start_pos = scene_start_pos_with_z_offset(
+            np.asarray(scene_pot_pos_w, dtype=np.float64),
+            float(start_z_offset_m),
         )
-        scene_start_pos = scene_start_pos_with_z_offset(scene_pos_w, float(args.start_z_offset_m))
         T_align = compute_start_align_delta(
             scene_start_pos,
-            scene_quat_w,
+            np.asarray(scene_pot_quat_w, dtype=np.float64),
             pos_world[0],
             quat_world[0],
-        )
-        print(
-            f"[align] scene_pot={scene_pos_w.round(4).tolist()} "
-            f"start_z_offset={float(args.start_z_offset_m):.4f} "
-            f"align_start={scene_start_pos.round(4).tolist()} "
-            f"traj0={pos_world[0].round(4).tolist()}",
-            flush=True,
         )
 
     left_grasp_local = right_grasp_local = None
     if fixed_grasp_offsets:
-        if scene_start_pos is None or scene_quat_w is None:
-            raise RuntimeError("fixed pot grasp offsets require --align-to-scene-pot")
-        lateral_offset = FIXED_GRASP_LATERAL_OFFSET_M * float(args.grasp_y_half_span_scale)
-        up_offset = FIXED_GRASP_UP_OFFSET_M + float(args.grasp_z_offset_m)
+        if scene_start_pos is None or scene_pot_quat_w is None:
+            raise RuntimeError("fixed pot grasp offsets require align_to_scene_pot")
+        lateral_offset = FIXED_GRASP_LATERAL_OFFSET_M * float(grasp_y_half_span_scale)
+        up_offset = FIXED_GRASP_UP_OFFSET_M + float(grasp_z_offset_m)
         left_grasp_local, right_grasp_local = grasp_locals_from_fixed_world_offsets(
             scene_start_pos,
-            scene_quat_w,
+            np.asarray(scene_pot_quat_w, dtype=np.float64),
             lateral_offset_m=lateral_offset,
             up_offset_m=up_offset,
         )
-        print(
-            f"[grasp] fixed lateral={lateral_offset:.4f} up={up_offset:.4f} "
-            f"left_local={left_grasp_local.round(4).tolist()} "
-            f"right_local={right_grasp_local.round(4).tolist()}",
-            flush=True,
-        )
 
-    if bool(args.align_to_scene_target):
-        trivet_pos_w, _ = wait_scene_target_pose(
-            pot_shm,
-            timeout_sec=float(args.align_timeout_sec),
-        )
-        end_target = compute_endpoint_pos_target(trivet_pos_w, z_offset_m=float(args.target_z_offset_m))
-        print(
-            f"[align] end_target={end_target.round(4).tolist()} "
-            f"trivet={trivet_pos_w.round(4).tolist()} z_offset={args.target_z_offset_m}",
-            flush=True,
-        )
+    end_target = None
+    if bool(align_to_scene_target):
+        if scene_target_pos_w is not None:
+            end_target = compute_endpoint_pos_target(
+                np.asarray(scene_target_pos_w, dtype=np.float64),
+                z_offset_m=float(target_z_offset_m),
+            )
 
     pot_pos_aligned, pot_quat_aligned = _apply_align_to_positions(pos_world, quat_world, T_align)
     pot_pos_final = pot_pos_aligned
@@ -447,13 +480,9 @@ def main() -> int:
         pot_pos_final = _apply_endpoint_correction_batch(pot_pos_aligned, end_target)
 
     z_floor = float(pot_pos_final[0, 2])
-    if bool(args.clamp_z_to_start):
+    n_clamped = 0
+    if bool(clamp_z_to_start_enabled):
         pot_pos_final, n_clamped = clamp_z_to_start(pot_pos_final, z_floor=z_floor)
-        if n_clamped:
-            print(
-                f"[align] clamp_z_to_start floor={z_floor:.4f} clamped_frames={n_clamped}",
-                flush=True,
-            )
 
     left_pos_final = right_pos_final = None
     left_quat_final = right_quat_final = None
@@ -476,6 +505,154 @@ def main() -> int:
             alpha = compute_arclength_alpha(pot_pos_aligned)
             left_pos_final = left_pos_aligned + alpha[:, None] * pot_delta
             right_pos_final = right_pos_aligned + alpha[:, None] * pot_delta
+
+    return {
+        "df": df,
+        "clean_summary": clean_summary,
+        "scene_start_pos": scene_start_pos,
+        "T_align": T_align,
+        "end_target": end_target,
+        "n_clamped": n_clamped,
+        "pot_pos_final": pot_pos_final,
+        "pot_quat_aligned": pot_quat_aligned,
+        "left_pos_final": left_pos_final,
+        "left_quat_final": left_quat_final,
+        "right_pos_final": right_pos_final,
+        "right_quat_final": right_quat_final,
+        "left_grasp_local": left_grasp_local,
+        "right_grasp_local": right_grasp_local,
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    mode = str(args.mode)
+    fixed_grasp_offsets = bool(args.fixed_grasp_offsets) and mode == "pot_ik"
+    path = Path(args.input).expanduser().resolve()
+    df = _load(path, mode=mode, require_hand_columns=not fixed_grasp_offsets)
+
+    pot_shm = try_open_shm(name=str(args.pot_shm_name), size=int(args.pot_shm_size))
+    if pot_shm is None:
+        raise RuntimeError(f"Failed to open pot shm: {args.pot_shm_name}")
+
+    base_pos = np.asarray(args.robot_base_pos_world, dtype=np.float64)
+    base_quat_wxyz = np.asarray(args.robot_base_quat_world_wxyz, dtype=np.float64)
+    ik_base_pos = (
+        base_pos.copy()
+        if args.ik_base_pos_world is None
+        else np.asarray(args.ik_base_pos_world, dtype=np.float64)
+    )
+    ik_base_quat_wxyz = (
+        base_quat_wxyz.copy()
+        if args.ik_base_quat_world_wxyz is None
+        else np.asarray(args.ik_base_quat_world_wxyz, dtype=np.float64)
+    )
+    pot_frame = str(args.pot_frame)
+
+    scene_pos_w = None
+    scene_quat_w = None
+    if bool(args.align_to_scene_pot):
+        scene_pos_w, scene_quat_w = wait_scene_pot_pose(
+            pot_shm,
+            timeout_sec=float(args.align_timeout_sec),
+        )
+
+    trivet_pos_w = None
+    if bool(args.align_to_scene_target):
+        trivet_pos_w, _ = wait_scene_target_pose(
+            pot_shm,
+            timeout_sec=float(args.align_timeout_sec),
+        )
+
+    targets = build_pot_replay_world_targets(
+        df,
+        mode=mode,
+        fixed_grasp_offsets=fixed_grasp_offsets,
+        base_pos=base_pos,
+        base_quat_wxyz=base_quat_wxyz,
+        pot_frame=pot_frame,
+        align_to_scene_pot=bool(args.align_to_scene_pot),
+        scene_pot_pos_w=scene_pos_w,
+        scene_pot_quat_w=scene_quat_w,
+        start_z_offset_m=float(args.start_z_offset_m),
+        align_to_scene_target=bool(args.align_to_scene_target),
+        scene_target_pos_w=trivet_pos_w,
+        target_z_offset_m=float(args.target_z_offset_m),
+        clamp_z_to_start_enabled=bool(args.clamp_z_to_start),
+        clean_trajectory=bool(args.clean_trajectory),
+        jump_thresh_m=float(args.jump_thresh_m),
+        tail_speed_thresh_m=float(args.tail_speed_thresh_m),
+        smooth_method=str(args.smooth_method),
+        smooth_pos_alpha=float(args.smooth_pos_alpha),
+        smooth_quat_alpha=float(args.smooth_quat_alpha),
+        smooth_meas_noise=float(args.smooth_meas_noise),
+        smooth_process_noise_pos=float(args.smooth_process_noise_pos),
+        smooth_process_noise_vel=float(args.smooth_process_noise_vel),
+        grasp_y_half_span_scale=float(args.grasp_y_half_span_scale),
+        grasp_z_offset_m=float(args.grasp_z_offset_m),
+    )
+    df = targets["df"]
+    clean_summary = targets["clean_summary"]
+    if clean_summary is not None:
+        summary = clean_summary
+        print(
+            f"[clean] frames={summary['frames_in']}->{summary['frames_out']} "
+            f"removed_outlier={summary['removed_outlier']} "
+            f"removed_tail={summary['removed_tail']} "
+            f"tail_cut_index={summary['tail_cut_index']}",
+            flush=True,
+        )
+    if str(args.smooth_method).strip().lower() not in ("none", "off", ""):
+        print(
+            f"[smooth] method={args.smooth_method} "
+            f"meas_noise={float(args.smooth_meas_noise):.2e} "
+            f"quat_alpha={float(args.smooth_quat_alpha):.3f}",
+            flush=True,
+        )
+
+    scene_start_pos = targets["scene_start_pos"]
+    if scene_start_pos is not None and scene_pos_w is not None:
+        print(
+            f"[align] scene_pot={scene_pos_w.round(4).tolist()} "
+            f"start_z_offset={float(args.start_z_offset_m):.4f} "
+            f"align_start={scene_start_pos.round(4).tolist()}",
+            flush=True,
+        )
+
+    left_grasp_local = targets["left_grasp_local"]
+    right_grasp_local = targets["right_grasp_local"]
+    if left_grasp_local is not None and right_grasp_local is not None:
+        lateral_offset = FIXED_GRASP_LATERAL_OFFSET_M * float(args.grasp_y_half_span_scale)
+        up_offset = FIXED_GRASP_UP_OFFSET_M + float(args.grasp_z_offset_m)
+        print(
+            f"[grasp] fixed lateral={lateral_offset:.4f} up={up_offset:.4f} "
+            f"left_local={left_grasp_local.round(4).tolist()} "
+            f"right_local={right_grasp_local.round(4).tolist()}",
+            flush=True,
+        )
+
+    end_target = targets["end_target"]
+    if end_target is not None and trivet_pos_w is not None:
+        print(
+            f"[align] end_target={end_target.round(4).tolist()} "
+            f"trivet={trivet_pos_w.round(4).tolist()} z_offset={args.target_z_offset_m}",
+            flush=True,
+        )
+
+    pot_pos_final = targets["pot_pos_final"]
+    pot_quat_aligned = targets["pot_quat_aligned"]
+    n_clamped = int(targets["n_clamped"])
+    if n_clamped:
+        print(
+            f"[align] clamp_z_to_start floor={float(pot_pos_final[0, 2]):.4f} "
+            f"clamped_frames={n_clamped}",
+            flush=True,
+        )
+
+    left_pos_final = targets["left_pos_final"]
+    left_quat_final = targets["left_quat_final"]
+    right_pos_final = targets["right_pos_final"]
+    right_quat_final = targets["right_quat_final"]
 
     arm_ctrl = None
     arm_ik = None
@@ -518,14 +695,14 @@ def main() -> int:
             left_tf = _world_pose_to_base_homo(
                 left_pos_w,
                 left_quat_w,
-                base_pos_world=base_pos,
-                base_quat_world_wxyz=base_quat_wxyz,
+                base_pos_world=ik_base_pos,
+                base_quat_world_wxyz=ik_base_quat_wxyz,
             )
             right_tf = _world_pose_to_base_homo(
                 right_pos_w,
                 right_quat_w,
-                base_pos_world=base_pos,
-                base_quat_world_wxyz=base_quat_wxyz,
+                base_pos_world=ik_base_pos,
+                base_quat_world_wxyz=ik_base_quat_wxyz,
             )
             if not printed_ik_frame:
                 print(
