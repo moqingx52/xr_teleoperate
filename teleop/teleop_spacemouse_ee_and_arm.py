@@ -971,6 +971,15 @@ def build_arg_parser():
     )
     parser.add_argument("--go-home-on-exit", action="store_true", help="Send both arms home on exit")
     parser.add_argument(
+        "--single-arm-ik-no-ipopt-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "For precision single-arm routes, keep the other arm held and use the local "
+            "single-arm IK result instead of falling back to the dual-arm IPOPT solver."
+        ),
+    )
+    parser.add_argument(
         "--record-parquet",
         type=str,
         default=None,
@@ -1063,6 +1072,11 @@ def main(argv=None):
                 recorder.sync_threshold_ns,
             )
         arm_ik, arm_ctrl = _build_arm_stack(args.arm, simulation_mode=args.sim)
+        setattr(
+            arm_ik,
+            "disable_single_arm_ipopt_fallback",
+            bool(args.single_arm_ik_no_ipopt_fallback),
+        )
         (
             gripper_ctrl,
             left_gripper_value,

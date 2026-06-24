@@ -588,6 +588,12 @@ class G1_29_ArmIK:
             )
             self._precision_ik_ready = True
             self.enable_joint_smoothing = False
+            self.precision_single_arm_position_deadband = 2e-3
+            self.precision_single_arm_rotation_deadband = np.deg2rad(0.5)
+            self.precision_dual_arm_position_threshold = 3e-2
+            self.precision_dual_arm_rotation_threshold = np.deg2rad(5.0)
+            self._last_precision_left_target = None
+            self._last_precision_right_target = None
             logger_mp.info("[G1_29_ArmIK] precision single-arm Pinocchio IK enabled.")
         except Exception as exc:
             logger_mp.warning(
@@ -646,6 +652,66 @@ class G1_29_ArmIK:
         wrist = np.asarray(wrist, dtype=np.float64)
         return pin.SE3(wrist[:3, :3], wrist[:3, 3])
 
+    def _current_frame_pose(self, q: np.ndarray, frame_id: int) -> pin.SE3:
+        pin.forwardKinematics(self.reduced_robot.model, self.reduced_robot.data, q)
+        pin.updateFramePlacements(self.reduced_robot.model, self.reduced_robot.data)
+        return self.reduced_robot.data.oMf[frame_id].copy()
+
+    def _target_delta(self, previous: pin.SE3, current: pin.SE3):
+        position_delta = float(np.linalg.norm(current.translation - previous.translation))
+        rotation_delta = float(np.linalg.norm(pin.log3(previous.rotation.T @ current.rotation)))
+        return position_delta, rotation_delta
+
+    def _target_changed(self, position_delta: float, rotation_delta: float) -> bool:
+        return (
+            position_delta > self.precision_single_arm_position_deadband
+            or rotation_delta > self.precision_single_arm_rotation_deadband
+        )
+
+    def _target_large_motion(self, position_delta: float, rotation_delta: float) -> bool:
+        return (
+            position_delta > self.precision_dual_arm_position_threshold
+            or rotation_delta > self.precision_dual_arm_rotation_threshold
+        )
+
+    def _precision_route(self, seed_q: np.ndarray, left_target: pin.SE3, right_target: pin.SE3):
+        if self._last_precision_left_target is None:
+            previous_left = self._current_frame_pose(seed_q, self.L_hand_id)
+        else:
+            previous_left = self._last_precision_left_target
+        if self._last_precision_right_target is None:
+            previous_right = self._current_frame_pose(seed_q, self.R_hand_id)
+        else:
+            previous_right = self._last_precision_right_target
+
+        left_pos_delta, left_rot_delta = self._target_delta(previous_left, left_target)
+        right_pos_delta, right_rot_delta = self._target_delta(previous_right, right_target)
+        left_changed = self._target_changed(left_pos_delta, left_rot_delta)
+        right_changed = self._target_changed(right_pos_delta, right_rot_delta)
+        left_large = self._target_large_motion(left_pos_delta, left_rot_delta)
+        right_large = self._target_large_motion(right_pos_delta, right_rot_delta)
+
+        if left_large and right_large:
+            return "both", (left_pos_delta, left_rot_delta), (right_pos_delta, right_rot_delta)
+        if left_changed and not right_changed:
+            return "left", (left_pos_delta, left_rot_delta), (right_pos_delta, right_rot_delta)
+        if right_changed and not left_changed:
+            return "right", (left_pos_delta, left_rot_delta), (right_pos_delta, right_rot_delta)
+        if left_changed and right_changed:
+            left_score = max(
+                left_pos_delta / self.precision_dual_arm_position_threshold,
+                left_rot_delta / self.precision_dual_arm_rotation_threshold,
+            )
+            right_score = max(
+                right_pos_delta / self.precision_dual_arm_position_threshold,
+                right_rot_delta / self.precision_dual_arm_rotation_threshold,
+            )
+            return ("left" if left_score >= right_score else "right"), (
+                left_pos_delta,
+                left_rot_delta,
+            ), (right_pos_delta, right_rot_delta)
+        return "hold", (left_pos_delta, left_rot_delta), (right_pos_delta, right_rot_delta)
+
     def _solve_ik_precision(self, left_wrist, right_wrist, current_lr_arm_motor_q=None, current_lr_arm_motor_dq=None):
         if current_lr_arm_motor_q is not None:
             seed_q = np.asarray(current_lr_arm_motor_q, dtype=np.float64).copy()
@@ -654,13 +720,40 @@ class G1_29_ArmIK:
 
         left_target = self._target_from_matrix(left_wrist)
         right_target = self._target_from_matrix(right_wrist)
-        left_result = self.left_precision_ik.solve_local(left_target, seed_q)
-        q_after_left = self.left_precision_ik.put_q(seed_q, left_result.q)
-        right_result = self.right_precision_ik.solve_local(right_target, q_after_left)
+        route, left_delta, right_delta = self._precision_route(seed_q, left_target, right_target)
+        left_result = IKResult(True, self.left_precision_ik.q_from_full(seed_q), 0.0, 0.0, 0, "held")
+        right_result = IKResult(True, self.right_precision_ik.q_from_full(seed_q), 0.0, 0.0, 0, "held")
+        sol_q = seed_q.copy()
 
-        if not (left_result.success and right_result.success):
+        if route in ("left", "both"):
+            left_result = self.left_precision_ik.solve_local(left_target, sol_q)
+            sol_q = self.left_precision_ik.put_q(sol_q, left_result.q)
+        if route in ("right", "both"):
+            right_result = self.right_precision_ik.solve_local(right_target, sol_q)
+            sol_q = self.right_precision_ik.put_q(sol_q, right_result.q)
+
+        if (
+            route in ("left", "right")
+            and not (left_result.success and right_result.success)
+            and bool(getattr(self, "disable_single_arm_ipopt_fallback", False))
+        ):
+            logger_mp.warning(
+                "[G1_29_ArmIK] precision single-arm IK did not meet strict tolerance; "
+                "using local single-arm solution without IPOPT fallback. "
+                f"route={route} "
+                f"left_delta=(p={left_delta[0]:.6g}, r={left_delta[1]:.6g}) "
+                f"right_delta=(p={right_delta[0]:.6g}, r={right_delta[1]:.6g}) "
+                f"left=({left_result.mode}, p={left_result.position_error:.6g}, "
+                f"r={left_result.rotation_error:.6g}, it={left_result.iterations}) "
+                f"right=({right_result.mode}, p={right_result.position_error:.6g}, "
+                f"r={right_result.rotation_error:.6g}, it={right_result.iterations})"
+            )
+        elif route != "hold" and not (left_result.success and right_result.success):
             logger_mp.warning(
                 "[G1_29_ArmIK] precision IK failed, falling back to IPOPT. "
+                f"route={route} "
+                f"left_delta=(p={left_delta[0]:.6g}, r={left_delta[1]:.6g}) "
+                f"right_delta=(p={right_delta[0]:.6g}, r={right_delta[1]:.6g}) "
                 f"left=({left_result.mode}, p={left_result.position_error:.6g}, "
                 f"r={left_result.rotation_error:.6g}, it={left_result.iterations}) "
                 f"right=({right_result.mode}, p={right_result.position_error:.6g}, "
@@ -668,12 +761,20 @@ class G1_29_ArmIK:
             )
             return self._solve_ik_ipopt(left_wrist, right_wrist, current_lr_arm_motor_q, current_lr_arm_motor_dq)
 
-        sol_q = self.right_precision_ik.put_q(q_after_left, right_result.q)
         sol_q = np.clip(
             sol_q,
             np.asarray(self.reduced_robot.model.lowerPositionLimit, dtype=np.float64),
             np.asarray(self.reduced_robot.model.upperPositionLimit, dtype=np.float64),
         )
+        if route in ("left", "both"):
+            self._last_precision_left_target = left_target.copy()
+        if route in ("right", "both"):
+            self._last_precision_right_target = right_target.copy()
+        if route == "hold":
+            if self._last_precision_left_target is None:
+                self._last_precision_left_target = left_target.copy()
+            if self._last_precision_right_target is None:
+                self._last_precision_right_target = right_target.copy()
         if current_lr_arm_motor_dq is not None:
             v = np.asarray(current_lr_arm_motor_dq, dtype=np.float64) * 0.0
         else:

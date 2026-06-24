@@ -34,6 +34,7 @@ class ReplayData:
     joint_pos: np.ndarray
     left_closed: np.ndarray
     right_closed: np.ndarray
+    source_format: str = "spacemouse"
 
 
 def _list_array(value: object, expected: int, column: str) -> np.ndarray:
@@ -64,6 +65,79 @@ def _estimate_hz(t_ns: np.ndarray) -> float:
     if dt.size == 0:
         return 30.0
     return float(1.0 / np.median(dt))
+
+
+def _timestamp_ns(df: pd.DataFrame) -> np.ndarray:
+    if "timestamp" in df.columns:
+        ts = df["timestamp"].to_numpy(dtype=np.float64)
+        if ts.size and np.nanmax(np.abs(ts)) < 1e6:
+            return ts * 1e9
+        return ts
+    if "frame_index" in df.columns:
+        return df["frame_index"].to_numpy(dtype=np.float64) * (1e9 / 30.0)
+    return np.arange(len(df), dtype=np.float64) * (1e9 / 30.0)
+
+
+def _closed_series(df: pd.DataFrame, candidates: list[str], *, default: float = 0.0) -> np.ndarray:
+    for col in candidates:
+        if col in df.columns:
+            values = df[col].ffill().fillna(default).to_numpy(dtype=np.float64)
+            return np.clip(values, 0.0, 1.0)
+    return np.full(len(df), float(default), dtype=np.float64)
+
+
+def _load_g1_joint_replay_data(df: pd.DataFrame, path: Path) -> ReplayData | None:
+    if "g1pro_nw.left_arm_q" not in df.columns or "g1pro_nw.right_arm_q" not in df.columns:
+        return None
+    joint_pos = np.vstack(
+        [
+            np.concatenate(
+                [
+                    _list_array(row["g1pro_nw.left_arm_q"], 7, "g1pro_nw.left_arm_q"),
+                    _list_array(row["g1pro_nw.right_arm_q"], 7, "g1pro_nw.right_arm_q"),
+                ]
+            )
+            for _, row in df.iterrows()
+        ]
+    )
+    t_ns = _timestamp_ns(df)
+    left = _closed_series(
+        df,
+        ["g1pro_nw.left_gripper", "aug.left_gripper_closed_smooth", "aug.left_gripper_closed_raw"],
+    )
+    right = _closed_series(
+        df,
+        ["g1pro_nw.right_gripper", "aug.right_gripper_closed_smooth", "aug.right_gripper_closed_raw"],
+    )
+    if joint_pos.size == 0:
+        raise ValueError(f"No G1 joint rows found in {path}")
+    return ReplayData(
+        commands=df.copy(),
+        command_t_ns=t_ns,
+        joint_pos=joint_pos,
+        left_closed=left,
+        right_closed=right,
+        source_format="g1pro_nw_joint",
+    )
+
+
+def _load_lerobot_action_replay_data(df: pd.DataFrame, path: Path) -> ReplayData | None:
+    if "action" not in df.columns:
+        return None
+    action = np.vstack([np.asarray(v, dtype=np.float64).reshape(-1) for v in df["action"]])
+    if action.ndim != 2 or action.shape[1] < 16:
+        return None
+    if not np.all(np.isfinite(action)):
+        raise ValueError(f"action contains non-finite values in {path}")
+    joint_pos = np.concatenate([action[:, 0:7], action[:, 8:15]], axis=1)
+    return ReplayData(
+        commands=df.copy(),
+        command_t_ns=_timestamp_ns(df),
+        joint_pos=joint_pos,
+        left_closed=np.clip(action[:, 7], 0.0, 1.0),
+        right_closed=np.clip(action[:, 15], 0.0, 1.0),
+        source_format="lerobot_action",
+    )
 
 
 def _reconstruct_gripper_from_raw(df: pd.DataFrame, command_t_ns: np.ndarray, smooth_alpha: float) -> tuple[np.ndarray, np.ndarray]:
@@ -103,6 +177,17 @@ def _reconstruct_gripper_from_raw(df: pd.DataFrame, command_t_ns: np.ndarray, sm
 
 def load_replay_data(path: Path, smooth_alpha: float) -> ReplayData:
     df = pd.read_parquet(path)
+    g1_data = _load_g1_joint_replay_data(df, path)
+    if g1_data is not None:
+        return g1_data
+    lerobot_data = _load_lerobot_action_replay_data(df, path)
+    if lerobot_data is not None:
+        return lerobot_data
+    if "entry_type" not in df.columns:
+        raise ValueError(
+            f"Unsupported replay parquet format: {path}. Expected SpaceMouse "
+            "entry_type/command.ik_joint_pos, G1 g1pro_nw.*_arm_q, or LeRobot action columns."
+        )
     cmd = df.loc[(df["entry_type"].astype(str) == "command") & df["command.t_ns"].notna()].copy()
     if cmd.empty:
         raise ValueError(f"No command rows found in {path}")
@@ -121,13 +206,21 @@ def load_replay_data(path: Path, smooth_alpha: float) -> ReplayData:
     else:
         left, right = _reconstruct_gripper_from_raw(df, t_ns, smooth_alpha=smooth_alpha)
 
-    return ReplayData(commands=cmd, command_t_ns=t_ns, joint_pos=joint_pos, left_closed=left, right_closed=right)
+    return ReplayData(
+        commands=cmd,
+        command_t_ns=t_ns,
+        joint_pos=joint_pos,
+        left_closed=left,
+        right_closed=right,
+        source_format="spacemouse",
+    )
 
 
 def _print_summary(path: Path, data: ReplayData) -> None:
     hz = _estimate_hz(data.command_t_ns)
     dt = np.diff(data.command_t_ns) / 1e9 if data.command_t_ns.size > 1 else np.zeros(0)
     print(f"input={path}")
+    print(f"source_format={data.source_format}")
     print(f"command_frames={data.command_t_ns.size} hz_median={hz:.3f}")
     if dt.size:
         print(f"dt_sec min/median/max={float(np.min(dt)):.4f}/{float(np.median(dt)):.4f}/{float(np.max(dt)):.4f}")
