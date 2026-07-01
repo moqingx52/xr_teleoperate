@@ -337,9 +337,6 @@ def build_arg_parser():
     parser.add_argument("--sim", action="store_true", help="Use simulation mode (shared memory)")
     parser.add_argument("--real", action="store_true", help="Force real robot mode (DDS)")
     parser.add_argument("--network-interface", type=str, default=None)
-    parser.add_argument("--workspace-limit-x", type=float, nargs=2, default=[-0.20, 0.80], metavar=("MIN", "MAX"))
-    parser.add_argument("--workspace-limit-y", type=float, nargs=2, default=[-0.80, 0.80], metavar=("MIN", "MAX"))
-    parser.add_argument("--workspace-limit-z", type=float, nargs=2, default=[-0.40, 0.80], metavar=("MIN", "MAX"))
     parser.add_argument("--gripper-input-min", type=float, default=0.0)
     parser.add_argument("--gripper-input-max", type=float, default=1.0)
     parser.add_argument("--gripper-open-input", type=float, default=1.0)
@@ -412,6 +409,7 @@ def main(argv=None):
 
         logger_mp.info("-------------------------------------------------------------")
         logger_mp.info("Keyboard direct EE-pose teleop started.")
+        logger_mp.info("EE workspace clamp=off; IK joint bounds come from the loaded robot URDF.")
         logger_mp.info(
             "Base-frame translation | W/S(+/-X), A/D(+/-Y), Up/Down or 8/2(+/-Z)",
         )
@@ -464,16 +462,6 @@ def main(argv=None):
 
             if pose_changed:
                 target_dirty = True
-
-            # Apply workspace clipping only for actively changed arm.
-            if pose_changed and selected_arm == "left":
-                left_target_tf[0, 3] = np.clip(left_target_tf[0, 3], args.workspace_limit_x[0], args.workspace_limit_x[1])
-                left_target_tf[1, 3] = np.clip(left_target_tf[1, 3], args.workspace_limit_y[0], args.workspace_limit_y[1])
-                left_target_tf[2, 3] = np.clip(left_target_tf[2, 3], args.workspace_limit_z[0], args.workspace_limit_z[1])
-            elif pose_changed and selected_arm == "right":
-                right_target_tf[0, 3] = np.clip(right_target_tf[0, 3], args.workspace_limit_x[0], args.workspace_limit_x[1])
-                right_target_tf[1, 3] = np.clip(right_target_tf[1, 3], args.workspace_limit_y[0], args.workspace_limit_y[1])
-                right_target_tf[2, 3] = np.clip(right_target_tf[2, 3], args.workspace_limit_z[0], args.workspace_limit_z[1])
 
             if gripper_ctrl is not None:
                 open_hold = ("q" in pressed) and ("e" not in pressed)

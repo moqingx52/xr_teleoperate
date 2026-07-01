@@ -26,6 +26,11 @@ BTN_2 = 8192
 BTN_3 = 16384
 BTN_4 = 32768
 
+# Parquet columns used as replay joint targets (this script never re-solves IK).
+JOINT_SOURCE_G1PRO = "g1pro_nw.left_arm_q+g1pro_nw.right_arm_q"
+JOINT_SOURCE_LEROBOT = "lerobot.action[left7+right7]"
+JOINT_SOURCE_TELEOP_RECORDED = "command.ik_joint_pos"
+
 
 @dataclass(frozen=True)
 class ReplayData:
@@ -34,7 +39,10 @@ class ReplayData:
     joint_pos: np.ndarray
     left_closed: np.ndarray
     right_closed: np.ndarray
-    source_format: str = "spacemouse"
+    joint_source: str
+    ik_at_replay: bool = False
+    left_gripper_action: np.ndarray | None = None
+    right_gripper_action: np.ndarray | None = None
 
 
 def _list_array(value: object, expected: int, column: str) -> np.ndarray:
@@ -86,6 +94,15 @@ def _closed_series(df: pd.DataFrame, candidates: list[str], *, default: float = 
     return np.full(len(df), float(default), dtype=np.float64)
 
 
+def _recorded_gripper_action(df: pd.DataFrame, column: str) -> np.ndarray | None:
+    if column not in df.columns:
+        return None
+    values = pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=np.float64)
+    if values.size != len(df) or not np.all(np.isfinite(values)):
+        return None
+    return np.clip(values, 0.0, 1.2)
+
+
 def _load_g1_joint_replay_data(df: pd.DataFrame, path: Path) -> ReplayData | None:
     if "g1pro_nw.left_arm_q" not in df.columns or "g1pro_nw.right_arm_q" not in df.columns:
         return None
@@ -117,7 +134,7 @@ def _load_g1_joint_replay_data(df: pd.DataFrame, path: Path) -> ReplayData | Non
         joint_pos=joint_pos,
         left_closed=left,
         right_closed=right,
-        source_format="g1pro_nw_joint",
+        joint_source=JOINT_SOURCE_G1PRO,
     )
 
 
@@ -136,7 +153,7 @@ def _load_lerobot_action_replay_data(df: pd.DataFrame, path: Path) -> ReplayData
         joint_pos=joint_pos,
         left_closed=np.clip(action[:, 7], 0.0, 1.0),
         right_closed=np.clip(action[:, 15], 0.0, 1.0),
-        source_format="lerobot_action",
+        joint_source=JOINT_SOURCE_LEROBOT,
     )
 
 
@@ -212,15 +229,42 @@ def load_replay_data(path: Path, smooth_alpha: float) -> ReplayData:
         joint_pos=joint_pos,
         left_closed=left,
         right_closed=right,
-        source_format="spacemouse",
+        joint_source=JOINT_SOURCE_TELEOP_RECORDED,
+        left_gripper_action=_recorded_gripper_action(cmd, "command.left_gripper_action"),
+        right_gripper_action=_recorded_gripper_action(cmd, "command.right_gripper_action"),
     )
+
+
+def _replay_mode_lines(data: ReplayData) -> list[str]:
+    lines = [
+        "replay_drive=joint_direct",
+        f"joint_source={data.joint_source}",
+        f"ik_at_replay={'true' if data.ik_at_replay else 'false'}",
+    ]
+    if data.joint_source == JOINT_SOURCE_TELEOP_RECORDED:
+        lines.append(
+            "replay_note=teleop IK solution stored in parquet at record time; "
+            "ctrl_dual_arm replays those joints and does not re-solve IK from command.eepose"
+        )
+    elif data.joint_source == JOINT_SOURCE_G1PRO:
+        lines.append("replay_note=recorded robot arm_q replayed via ctrl_dual_arm")
+    elif data.joint_source == JOINT_SOURCE_LEROBOT:
+        lines.append("replay_note=LeRobot arm joints replayed via ctrl_dual_arm")
+    else:
+        lines.append("replay_note=joint targets replayed via ctrl_dual_arm")
+    return lines
+
+
+def _print_replay_mode(data: ReplayData) -> None:
+    for line in _replay_mode_lines(data):
+        print(line)
 
 
 def _print_summary(path: Path, data: ReplayData) -> None:
     hz = _estimate_hz(data.command_t_ns)
     dt = np.diff(data.command_t_ns) / 1e9 if data.command_t_ns.size > 1 else np.zeros(0)
     print(f"input={path}")
-    print(f"source_format={data.source_format}")
+    _print_replay_mode(data)
     print(f"command_frames={data.command_t_ns.size} hz_median={hz:.3f}")
     if dt.size:
         print(f"dt_sec min/median/max={float(np.min(dt)):.4f}/{float(np.median(dt)):.4f}/{float(np.max(dt)):.4f}")
@@ -234,6 +278,8 @@ def _print_summary(path: Path, data: ReplayData) -> None:
         f"range=[{float(np.min(data.right_closed)):.3f},{float(np.max(data.right_closed)):.3f}] "
         f"frames_gt_0.5={int(np.sum(data.right_closed > 0.5))}"
     )
+    recorded_action = data.left_gripper_action is not None and data.right_gripper_action is not None
+    print(f"recorded_gripper_action={'available' if recorded_action else 'unavailable'}")
     if "aug.event_type" in data.commands.columns:
         counts = data.commands["aug.event_type"].fillna("none").value_counts()
         event_items = [(k, int(v)) for k, v in counts.items() if k != "none"]
@@ -299,17 +345,66 @@ def _wait_until_sim_step(
     raise TimeoutError(f"Timed out waiting for sim_step>={target_step}; last_step={last_step}")
 
 
+def _sim_step_offsets(
+    command_t_ns: np.ndarray,
+    *,
+    timing: str,
+    sim_hz: float,
+    fixed_steps_per_command: int,
+) -> np.ndarray:
+    count = int(command_t_ns.size)
+    if count == 0:
+        return np.zeros(0, dtype=np.int64)
+    if timing == "fixed":
+        return np.arange(count, dtype=np.int64) * max(1, int(fixed_steps_per_command))
+    hz = float(sim_hz)
+    if not np.isfinite(hz) or hz <= 0.0:
+        raise ValueError(f"sim_hz must be positive, got {sim_hz}")
+    elapsed_sec = (np.asarray(command_t_ns, dtype=np.float64) - float(command_t_ns[0])) / 1e9
+    elapsed_sec = np.maximum.accumulate(np.maximum(elapsed_sec, 0.0))
+    return np.rint(elapsed_sec * hz).astype(np.int64)
+
+
+class _RecordedGripperActionWriter:
+    def __init__(self, active_sides: tuple[str, ...], timeout_sec: float):
+        from teleop.utils.isaac_shm import SHM_INSPIRE_CMD, SIZE_INSPIRE, try_open_shm
+
+        deadline = time.monotonic() + max(1.0, float(timeout_sec))
+        self._shm = None
+        while time.monotonic() < deadline and self._shm is None:
+            self._shm = try_open_shm(SHM_INSPIRE_CMD, SIZE_INSPIRE)
+            if self._shm is None:
+                time.sleep(0.01)
+        if self._shm is None:
+            raise TimeoutError(f"Timed out attaching recorded gripper action shm={SHM_INSPIRE_CMD}")
+        self._active_sides = active_sides
+
+    def publish(self, left_action: float, right_action: float) -> None:
+        payload = {
+            "positions": [float(right_action)] * 6 + [float(left_action)] * 6,
+            "active_sides": list(self._active_sides),
+        }
+        if not self._shm.write_data(payload):
+            raise RuntimeError("Failed to publish recorded gripper action")
+
+    def close(self) -> None:
+        self._shm.close()
+
+
+def _active_gripper_sides(value: str) -> tuple[str, ...]:
+    if value == "left":
+        return ("left",)
+    if value == "right":
+        return ("right",)
+    return ("left", "right")
+
+
 def _make_gripper_controller(args: argparse.Namespace):
     if args.ee == "none":
         return None, None, None
     from teleop.robot_control.robot_hand_inspire import Inspire_Gripper_Controller
 
-    if args.gripper_sides == "left":
-        active_sides = ("left",)
-    elif args.gripper_sides == "right":
-        active_sides = ("right",)
-    else:
-        active_sides = ("left", "right")
+    active_sides = _active_gripper_sides(args.gripper_sides)
 
     left_value = Value("d", float(args.gripper_open_input), lock=True)
     right_value = Value("d", float(args.gripper_open_input), lock=True)
@@ -341,7 +436,25 @@ def _closed_to_input(closed_value: float, open_input: float, close_input: float)
 
 def replay(data: ReplayData, args: argparse.Namespace) -> None:
     arm_ctrl = _make_arm_controller(sim=bool(args.sim), network_interface=args.network_interface)
-    gripper_ctrl, left_gripper_value, right_gripper_value = _make_gripper_controller(args)
+    recorded_gripper_available = (
+        data.left_gripper_action is not None and data.right_gripper_action is not None
+    )
+    use_recorded_gripper = args.gripper_replay_mode == "recorded-action" or (
+        args.gripper_replay_mode == "auto" and recorded_gripper_available
+    )
+    if use_recorded_gripper and not recorded_gripper_available:
+        raise ValueError("--gripper-replay-mode recorded-action requires recorded gripper action columns")
+    recorded_gripper_writer = None
+    if use_recorded_gripper and args.ee != "none":
+        recorded_gripper_writer = _RecordedGripperActionWriter(
+            _active_gripper_sides(args.gripper_sides),
+            timeout_sec=float(args.sim_step_timeout_sec),
+        )
+        gripper_ctrl = left_gripper_value = right_gripper_value = None
+        print("gripper_replay=recorded_action_direct")
+    else:
+        gripper_ctrl, left_gripper_value, right_gripper_value = _make_gripper_controller(args)
+        print("gripper_replay=input_controller")
     del gripper_ctrl
 
     sim_step_sync = bool(args.sim_step_sync and args.sim)
@@ -352,10 +465,20 @@ def replay(data: ReplayData, args: argparse.Namespace) -> None:
     start_wall = time.monotonic()
     first_t = float(data.command_t_ns[0])
     last_print = 0.0
-    next_target_step: int | None = None
+    base_step: int | None = None
+    step_offsets = _sim_step_offsets(
+        data.command_t_ns,
+        timing=str(args.sim_step_timing),
+        sim_hz=float(args.sim_hz),
+        fixed_steps_per_command=sim_steps_per_command,
+    )
     if sim_step_sync:
         base_step = _wait_sim_step_available(arm_ctrl, timeout_sec=sim_step_timeout_sec)
-        next_target_step = base_step
+        print(
+            f"sim_step_timing={args.sim_step_timing} sim_hz={float(args.sim_hz):.6g} "
+            f"recorded_duration_sec={(float(data.command_t_ns[-1]) - first_t) / 1e9:.6f} "
+            f"scheduled_steps={int(step_offsets[-1])}"
+        )
 
     try:
         for i, q in enumerate(data.joint_pos):
@@ -371,7 +494,14 @@ def replay(data: ReplayData, args: argparse.Namespace) -> None:
                 sleep_t = fixed_period - (loop_start - last_print if False else 0.0)
                 del sleep_t
 
-            if left_gripper_value is not None and right_gripper_value is not None:
+            if recorded_gripper_writer is not None:
+                assert data.left_gripper_action is not None
+                assert data.right_gripper_action is not None
+                recorded_gripper_writer.publish(
+                    float(data.left_gripper_action[i]),
+                    float(data.right_gripper_action[i]),
+                )
+            elif left_gripper_value is not None and right_gripper_value is not None:
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = _closed_to_input(
                         data.left_closed[i],
@@ -389,8 +519,8 @@ def replay(data: ReplayData, args: argparse.Namespace) -> None:
             now = time.monotonic()
             if now - last_print >= float(args.print_period):
                 suffix = ""
-                if sim_step_sync and next_target_step is not None:
-                    suffix = f" sim_step_target={next_target_step + sim_steps_per_command}"
+                if sim_step_sync and base_step is not None and i + 1 < len(step_offsets):
+                    suffix = f" sim_step_target={base_step + int(step_offsets[i + 1])}"
                 print(
                     f"frame={i + 1}/{len(data.joint_pos)} "
                     f"left_closed={data.left_closed[i]:.3f} right_closed={data.right_closed[i]:.3f}"
@@ -398,17 +528,19 @@ def replay(data: ReplayData, args: argparse.Namespace) -> None:
                 )
                 last_print = now
             if sim_step_sync:
-                assert next_target_step is not None
-                next_target_step += sim_steps_per_command
-                _wait_until_sim_step(
-                    arm_ctrl,
-                    next_target_step,
-                    timeout_sec=sim_step_timeout_sec,
-                )
+                assert base_step is not None
+                if i + 1 < len(step_offsets):
+                    _wait_until_sim_step(
+                        arm_ctrl,
+                        base_step + int(step_offsets[i + 1]),
+                        timeout_sec=sim_step_timeout_sec,
+                    )
             elif fixed_period is not None:
                 elapsed = time.monotonic() - loop_start
                 time.sleep(max(0.0, fixed_period - elapsed))
     finally:
+        if recorded_gripper_writer is not None:
+            recorded_gripper_writer.close()
         if args.go_home_on_exit:
             arm_ctrl.ctrl_dual_arm_go_home()
 
@@ -453,12 +585,33 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Number of JoySim 120Hz simulation steps to hold each 30Hz parquet command when --sim-step-sync is enabled.",
     )
     parser.add_argument(
+        "--sim-step-timing",
+        choices=("timestamps", "fixed"),
+        default="timestamps",
+        help="Map recorded timestamps to simulation steps (default), or use a fixed step count.",
+    )
+    parser.add_argument(
+        "--sim-hz",
+        type=float,
+        default=120.0,
+        help="Simulation frequency used to map recorded timestamps to steps.",
+    )
+    parser.add_argument(
         "--sim-step-timeout-sec",
         type=float,
         default=120.0,
         help="Timeout while waiting for simulation steps in --sim-step-sync mode.",
     )
     parser.add_argument("--go-home-on-exit", action="store_true")
+    parser.add_argument(
+        "--gripper-replay-mode",
+        choices=("auto", "recorded-action", "input-controller"),
+        default="auto",
+        help=(
+            "Use recorded filtered gripper actions when available (auto/default), "
+            "or re-run the wall-clock input controller for legacy data."
+        ),
+    )
     return parser.parse_args(argv)
 
 

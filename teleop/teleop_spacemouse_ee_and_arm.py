@@ -430,6 +430,11 @@ def _format_pose(T: np.ndarray) -> str:
     )
 
 
+def _format_vec(values: np.ndarray, precision: int = 4) -> str:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    return "[" + ", ".join(f"{v:+.{precision}f}" for v in arr) + "]"
+
+
 def _fk_dual_ee_tf(arm_ik, q_lr: np.ndarray):
     model = arm_ik.reduced_robot.model
     data = arm_ik.reduced_robot.data
@@ -445,6 +450,57 @@ def _fk_dual_ee_tf(arm_ik, q_lr: np.ndarray):
     return left, right
 
 
+def _copy_tf(tf: np.ndarray) -> np.ndarray:
+    return np.asarray(tf, dtype=np.float64).reshape(4, 4).copy()
+
+
+def _sync_idle_arm_target(
+    selected_arm: str,
+    left_actual_tf: np.ndarray,
+    right_actual_tf: np.ndarray,
+    left_target_tf: np.ndarray,
+    right_target_tf: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Keep the inactive arm's IK target aligned with measured FK."""
+    if selected_arm == "left":
+        right_target_tf = _copy_tf(right_actual_tf)
+    else:
+        left_target_tf = _copy_tf(left_actual_tf)
+    return left_target_tf, right_target_tf
+
+
+def _freeze_inactive_arm_joints(
+    sol_q: np.ndarray,
+    inactive_hold_q: np.ndarray,
+    selected_arm: str,
+) -> np.ndarray:
+    """Do not command the arm that is not being teleoperated."""
+    out = np.asarray(sol_q, dtype=np.float64).reshape(-1).copy()
+    held = np.asarray(inactive_hold_q, dtype=np.float64).reshape(-1)
+    if out.shape != held.shape:
+        return out
+    if selected_arm == "left":
+        out[7:] = held[7:]
+    else:
+        out[:7] = held[:7]
+    return out
+
+
+def _freeze_inactive_arm_tauff(
+    sol_tauff: np.ndarray,
+    selected_arm: str,
+) -> np.ndarray:
+    """Avoid feed-forward torque on the arm that is not being teleoperated."""
+    out = np.asarray(sol_tauff, dtype=np.float64).reshape(-1).copy()
+    if out.shape[0] < 14:
+        return out
+    if selected_arm == "left":
+        out[7:14] = 0.0
+    else:
+        out[:7] = 0.0
+    return out
+
+
 def _build_arm_stack(arm_name: str, simulation_mode: bool):
     if arm_name == "G1_29":
         return G1_29_ArmIK(), G1_29_ArmController(simulation_mode=simulation_mode)
@@ -453,6 +509,31 @@ def _build_arm_stack(arm_name: str, simulation_mode: bool):
     if arm_name == "H1_2":
         return H1_2_ArmIK(), H1_2_ArmController(simulation_mode=simulation_mode)
     return H1_ArmIK(), H1_ArmController(simulation_mode=simulation_mode)
+
+
+def _prepare_teleop_ik_solve(arm_ik, selected_arm: str, pose_changed: bool) -> None:
+    """Avoid precision-route 'hold' when SpaceMouse input is active."""
+    forced_route = selected_arm if pose_changed else None
+    setattr(arm_ik, "teleop_forced_route", forced_route)
+    if pose_changed and hasattr(arm_ik, "_last_precision_left_target"):
+        arm_ik._last_precision_left_target = None
+        arm_ik._last_precision_right_target = None
+
+
+def _configure_precision_single_arm_ik(arm_ik, max_iterations: int | None):
+    if max_iterations is None:
+        return
+    configured = False
+    for solver_name in ("left_precision_ik", "right_precision_ik"):
+        solver = getattr(arm_ik, solver_name, None)
+        if solver is None or not hasattr(solver, "max_iterations"):
+            continue
+        solver.max_iterations = int(max_iterations)
+        configured = True
+    if configured:
+        logger_mp.info("Precision single-arm IK max_iterations=%d", int(max_iterations))
+    else:
+        logger_mp.warning("Precision single-arm IK max_iterations requested but no precision solver is active.")
 
 
 def _build_gripper_controller(args):
@@ -726,6 +807,9 @@ def _hid_reader_loop(
     buttons_prev = 0
     buttons_initialized = False
     short_button_report_warned = False
+    report_counts: dict[int, int] = {}
+    total_reports = 0
+    last_report_summary_t = time.time()
     fd = None
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -747,6 +831,25 @@ def _hid_reader_loop(
             if not data:
                 continue
             rid = data[0]
+            total_reports += 1
+            report_counts[rid] = report_counts.get(rid, 0) + 1
+            if total_reports <= 16 or (rid not in (1, 2, 3) and report_counts[rid] <= 8):
+                logger_mp.info(
+                    "[spacemouse/raw] sample#%d rid=%d len=%d bytes=%s",
+                    total_reports,
+                    rid,
+                    len(data),
+                    data[: min(len(data), 16)].hex(" "),
+                )
+            now = time.time()
+            if now - last_report_summary_t >= 2.0:
+                logger_mp.info(
+                    "[spacemouse/raw] report_counts total=%d %s current_buttons=%d",
+                    total_reports,
+                    dict(sorted(report_counts.items())),
+                    state.peek()[6],
+                )
+                last_report_summary_t = now
             if rid == 1 and len(data) >= 7:
                 tx, ty, tz = struct.unpack_from("<hhh", data, 1)
                 state.on_translation(tx, ty, tz)
@@ -800,6 +903,13 @@ def _hid_reader_loop(
                     pressed = new_b & ~buttons_prev
                     buttons_prev = new_b
                     state.on_buttons(new_b, pressed)
+                logger_mp.info(
+                    "[spacemouse/buttons] rid=3 len=%d raw=%d edges=%d bytes=%s",
+                    len(data),
+                    new_b,
+                    pressed,
+                    data[: min(len(data), 16)].hex(" "),
+                )
                 if recorder is not None:
                     t_ns = time.monotonic_ns()
                     raw_tx, raw_ty, raw_tz, raw_rx, raw_ry, raw_rz, raw_buttons = state.peek()
@@ -919,9 +1029,6 @@ def build_arg_parser():
     parser.add_argument("--sim", action="store_true", help="Simulation mode (shared memory)")
     parser.add_argument("--real", action="store_true", help="Real robot (DDS)")
     parser.add_argument("--network-interface", type=str, default=None)
-    parser.add_argument("--workspace-limit-x", type=float, nargs=2, default=[-0.20, 0.80], metavar=("MIN", "MAX"))
-    parser.add_argument("--workspace-limit-y", type=float, nargs=2, default=[-0.80, 0.80], metavar=("MIN", "MAX"))
-    parser.add_argument("--workspace-limit-z", type=float, nargs=2, default=[-2.0, 2.0], metavar=("MIN", "MAX"))
     parser.add_argument("--gripper-input-min", type=float, default=0.0)
     parser.add_argument("--gripper-input-max", type=float, default=1.0)
     parser.add_argument("--gripper-open-input", type=float, default=1.0)
@@ -971,12 +1078,40 @@ def build_arg_parser():
     )
     parser.add_argument("--go-home-on-exit", action="store_true", help="Send both arms home on exit")
     parser.add_argument(
-        "--single-arm-ik-no-ipopt-fallback",
+        "--dual-arm-ik",
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
+            "Use CasADi/IPOPT dual-arm IK (both wrists solved jointly) instead of "
+            "Pinocchio precision single-arm IK."
+        ),
+    )
+    parser.add_argument(
+        "--single-arm-ik-no-ipopt-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
             "For precision single-arm routes, keep the other arm held and use the local "
-            "single-arm IK result instead of falling back to the dual-arm IPOPT solver."
+            "single-arm IK result instead of falling back to the dual-arm IPOPT solver. "
+            "Defaults to enabled in --sim mode."
+        ),
+    )
+    parser.add_argument(
+        "--precision-single-arm-max-iterations",
+        type=int,
+        default=None,
+        help=(
+            "Optional iteration cap for the Pinocchio precision single-arm IK. "
+            "Lower values keep SpaceMouse teleop responsive by accepting the latest local solution."
+        ),
+    )
+    parser.add_argument(
+        "--spacemouse-target-from-current",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Apply each active SpaceMouse delta from the latest measured FK instead of accumulating "
+            "an independent EE target. This lets fresh input overwrite stale non-converged targets."
         ),
     )
     parser.add_argument(
@@ -1022,6 +1157,10 @@ def main(argv=None):
         args.sim = False
     if not args.real and not args.sim:
         args.sim = True
+    if args.single_arm_ik_no_ipopt_fallback is None:
+        args.single_arm_ik_no_ipopt_fallback = bool(args.sim)
+    if args.precision_single_arm_max_iterations is not None and args.precision_single_arm_max_iterations < 1:
+        parser.error("--precision-single-arm-max-iterations must be >= 1")
     if args.ee == "omnipicker":
         args.ee = "inspire_gripper"
     if str(args.hidraw_device).lower() == "auto":
@@ -1072,6 +1211,8 @@ def main(argv=None):
                 recorder.sync_threshold_ns,
             )
         arm_ik, arm_ctrl = _build_arm_stack(args.arm, simulation_mode=args.sim)
+        if args.dual_arm_ik:
+            arm_ik.enable_precision_ik = False
         setattr(
             arm_ik,
             "disable_single_arm_ipopt_fallback",
@@ -1086,13 +1227,32 @@ def main(argv=None):
             dual_gripper_action_array,
         ) = _build_gripper_controller(args)
 
+        if args.sim and hasattr(arm_ctrl, "get_sim_named_joint_positions"):
+            named_joint_positions = arm_ctrl.get_sim_named_joint_positions()
+            logger_mp.info(
+                "[teleop/init] sim named joint positions count=%d sample=%s",
+                len(named_joint_positions),
+                list(named_joint_positions.keys())[:12],
+            )
+            if hasattr(arm_ik, "align_locked_joints_from_sim_state"):
+                aligned = arm_ik.align_locked_joints_from_sim_state(named_joint_positions)
+                logger_mp.info("[teleop/init] align_locked_joints_from_sim_state=%s", aligned)
+        _configure_precision_single_arm_ik(
+            arm_ik,
+            args.precision_single_arm_max_iterations,
+        )
+
         q_now = arm_ctrl.get_current_dual_arm_q()
         left_actual_tf, right_actual_tf = _fk_dual_ee_tf(arm_ik, q_now)
         left_target_tf = _pose_vec_to_tf(args.left_ee_pose) if args.left_ee_pose is not None else left_actual_tf.copy()
         right_target_tf = _pose_vec_to_tf(args.right_ee_pose) if args.right_ee_pose is not None else right_actual_tf.copy()
         hold_q = q_now.copy()
+        inactive_hold_q = q_now.copy()
         hold_tauff = np.zeros_like(hold_q, dtype=np.float64)
         target_dirty = args.left_ee_pose is not None or args.right_ee_pose is not None
+        last_diag_q = q_now.copy()
+        last_diag_left_target = left_target_tf.copy()
+        last_diag_right_target = right_target_tf.copy()
 
         selected_arm = "left"
         control_mode = "position"  # "position" | "orientation"
@@ -1106,6 +1266,15 @@ def main(argv=None):
 
         logger_mp.info("-------------------------------------------------------------")
         logger_mp.info("SpaceMouse EE teleop started (default arm: LEFT).")
+        logger_mp.info("EE workspace clamp=off; IK joint bounds come from the loaded robot URDF.")
+        ik_backend = "dual_arm_ipopt" if args.dual_arm_ik else "precision_single_arm"
+        logger_mp.info(
+            "IK backend=%s, no_ipopt_fallback=%s, inactive_arm_joint_freeze=on, "
+            "inactive_arm_tauff_zero=on, idle_target_sync=on, target_from_current=%s",
+            ik_backend,
+            bool(args.single_arm_ik_no_ipopt_fallback),
+            bool(args.spacemouse_target_from_current),
+        )
         logger_mp.info("Device: %s", args.hidraw_device)
         logger_mp.info("Position mode: cap translation -> base XYZ | Mode button toggles orientation mode")
         logger_mp.info(
@@ -1132,6 +1301,16 @@ def main(argv=None):
                 float(args.gripper_contact_hold_speed_threshold),
                 float(args.gripper_contact_hold_min_duration),
             )
+        logger_mp.info(
+            "[teleop/init] q_now left=%s right=%s",
+            _format_vec(q_now[:7]),
+            _format_vec(q_now[7:]),
+        )
+        logger_mp.info(
+            "[teleop/init] left_actual=%s | right_actual=%s",
+            _format_pose(left_actual_tf),
+            _format_pose(right_actual_tf),
+        )
         logger_mp.info("-------------------------------------------------------------")
 
         last_print_t = 0.0
@@ -1150,6 +1329,7 @@ def main(argv=None):
             tick_t_ns = time.monotonic_ns()
             tx, ty, tz, rx, ry, rz, raw_buttons, edges = sm_state.snapshot()
 
+            previous_selected_arm = selected_arm
             if args.debug_buttons and raw_buttons != last_raw_buttons:
                 logger_mp.info(
                     "[spacemouse] buttons raw=%d bits(mode,1,2,3,4)=(%d,%d,%d,%d,%d) edges=%d",
@@ -1176,6 +1356,30 @@ def main(argv=None):
             current_q = arm_ctrl.get_current_dual_arm_q()
             current_dq = arm_ctrl.get_current_dual_arm_dq()
             left_actual_tf, right_actual_tf = _fk_dual_ee_tf(arm_ik, current_q)
+            if selected_arm != previous_selected_arm:
+                if selected_arm == "left":
+                    inactive_hold_q[7:] = current_q[7:]
+                else:
+                    inactive_hold_q[:7] = current_q[:7]
+                logger_mp.info(
+                    "[teleop/arm-switch] selected=%s inactive_hold_left=%s inactive_hold_right=%s",
+                    selected_arm,
+                    _format_vec(inactive_hold_q[:7]),
+                    _format_vec(inactive_hold_q[7:]),
+                )
+            if edges & BTN_1:
+                left_target_tf = _copy_tf(left_actual_tf)
+                target_dirty = True
+            elif edges & BTN_2:
+                right_target_tf = _copy_tf(right_actual_tf)
+                target_dirty = True
+            left_target_tf, right_target_tf = _sync_idle_arm_target(
+                selected_arm,
+                left_actual_tf,
+                right_actual_tf,
+                left_target_tf,
+                right_target_tf,
+            )
 
             pose_changed = False
             if control_mode == "position":
@@ -1196,6 +1400,12 @@ def main(argv=None):
                 )
                 pose_changed = dR_base is not None
 
+            if pose_changed and args.spacemouse_target_from_current:
+                if selected_arm == "left":
+                    left_target_tf = _copy_tf(left_actual_tf)
+                else:
+                    right_target_tf = _copy_tf(right_actual_tf)
+
             if selected_arm == "left":
                 left_target_tf = _apply_keyboard_delta(
                     left_target_tf,
@@ -1211,15 +1421,6 @@ def main(argv=None):
 
             if pose_changed:
                 target_dirty = True
-
-            if pose_changed and selected_arm == "left":
-                left_target_tf[0, 3] = np.clip(left_target_tf[0, 3], args.workspace_limit_x[0], args.workspace_limit_x[1])
-                left_target_tf[1, 3] = np.clip(left_target_tf[1, 3], args.workspace_limit_y[0], args.workspace_limit_y[1])
-                left_target_tf[2, 3] = np.clip(left_target_tf[2, 3], args.workspace_limit_z[0], args.workspace_limit_z[1])
-            elif pose_changed and selected_arm == "right":
-                right_target_tf[0, 3] = np.clip(right_target_tf[0, 3], args.workspace_limit_x[0], args.workspace_limit_x[1])
-                right_target_tf[1, 3] = np.clip(right_target_tf[1, 3], args.workspace_limit_y[0], args.workspace_limit_y[1])
-                right_target_tf[2, 3] = np.clip(right_target_tf[2, 3], args.workspace_limit_z[0], args.workspace_limit_z[1])
 
             if gripper_ctrl is not None:
                 target_gripper_value = left_gripper_value if selected_arm == "left" else right_gripper_value
@@ -1284,13 +1485,36 @@ def main(argv=None):
                 )
 
             if target_dirty:
+                _prepare_teleop_ik_solve(arm_ik, selected_arm, pose_changed)
+                solve_t0 = time.time()
                 sol_q, sol_tauff = arm_ik.solve_ik(left_target_tf, right_target_tf, current_q, current_dq)
-                hold_q = np.asarray(sol_q, dtype=np.float64).copy()
-                hold_tauff = np.asarray(sol_tauff, dtype=np.float64).copy()
+                solve_ms = (time.time() - solve_t0) * 1000.0
+                setattr(arm_ik, "teleop_forced_route", None)
+                hold_q = _freeze_inactive_arm_joints(sol_q, inactive_hold_q, selected_arm)
+                if selected_arm == "left":
+                    hold_q[:7] = np.asarray(sol_q[:7], dtype=np.float64)
+                    inactive_hold_q[:7] = hold_q[:7]
+                else:
+                    hold_q[7:] = np.asarray(sol_q[7:], dtype=np.float64)
+                    inactive_hold_q[7:] = hold_q[7:]
+                hold_tauff = _freeze_inactive_arm_tauff(sol_tauff, selected_arm)
+                logger_mp.info(
+                    "[teleop/ik] solve selected=%s mode=%s pose_changed=%s backend=%s solve_ms=%.2f "
+                    "dq_left_inf=%.5f dq_right_inf=%.5f",
+                    selected_arm,
+                    control_mode,
+                    pose_changed,
+                    ik_backend,
+                    solve_ms,
+                    float(np.max(np.abs(np.asarray(sol_q[:7]) - np.asarray(current_q[:7])))),
+                    float(np.max(np.abs(np.asarray(sol_q[7:]) - np.asarray(current_q[7:])))),
+                )
                 target_dirty = False
             else:
                 sol_q = hold_q
                 sol_tauff = hold_tauff
+            sol_q = _freeze_inactive_arm_joints(sol_q, inactive_hold_q, selected_arm)
+            sol_tauff = _freeze_inactive_arm_tauff(sol_tauff, selected_arm)
             should_record = recorder is not None and (
                 not args.record_idle_pause
                 or _is_active_input(
@@ -1346,12 +1570,26 @@ def main(argv=None):
             if now - last_print_t >= float(args.print_period):
                 desired_tf = left_target_tf if selected_arm == "left" else right_target_tf
                 actual_tf = left_actual_tf if selected_arm == "left" else right_actual_tf
+                left_target_delta = float(
+                    np.linalg.norm(left_target_tf[:3, 3] - last_diag_left_target[:3, 3])
+                )
+                right_target_delta = float(
+                    np.linalg.norm(right_target_tf[:3, 3] - last_diag_right_target[:3, 3])
+                )
+                left_q_delta = float(np.max(np.abs(np.asarray(sol_q[:7]) - np.asarray(last_diag_q[:7]))))
+                right_q_delta = float(np.max(np.abs(np.asarray(sol_q[7:]) - np.asarray(last_diag_q[7:]))))
                 msg = (
                     f"[{selected_arm.upper()}|{control_mode}] desired: {_format_pose(desired_tf)} | "
                     f"actual: {_format_pose(actual_tf)} | dev t=({tx},{ty},{tz}) r=({rx},{ry},{rz})"
                 )
                 if args.debug_buttons:
                     msg += f" | buttons(raw/edges)=({raw_buttons}/{edges})"
+                msg += (
+                    f" | q_delta_since_log(L/R)=({left_q_delta:.5f}/{right_q_delta:.5f})"
+                    f" | target_xyz_delta_since_log(L/R)=({left_target_delta:.5f}/{right_target_delta:.5f})"
+                    f" | sol_q_left={_format_vec(sol_q[:7])}"
+                    f" | sol_q_right={_format_vec(sol_q[7:])}"
+                )
                 if gripper_ctrl is not None and dual_gripper_state_array is not None:
                     with dual_gripper_data_lock:
                         if selected_arm == "left":
@@ -1362,6 +1600,9 @@ def main(argv=None):
                             g_action = float(dual_gripper_action_array[1])
                     msg += f" | gripper(action/state)=({g_action:.3f}/{g_state:.3f})"
                 logger_mp.info(msg)
+                last_diag_q = np.asarray(sol_q, dtype=np.float64).copy()
+                last_diag_left_target = left_target_tf.copy()
+                last_diag_right_target = right_target_tf.copy()
                 last_print_t = now
 
             elapsed = time.time() - tick_t0

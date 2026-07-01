@@ -148,7 +148,20 @@ def _run_one_replay(parquet_path: Path, args: argparse.Namespace) -> int:
         if args.go_home_on_exit:
             cmd.append("--go-home-on-exit")
 
-    print(f"[batch-replay] replay start: {parquet_path}", flush=True)
+    if args.replay_mode == "ee_ik":
+        print(
+            f"[batch-replay] replay start: {parquet_path} "
+            "replay_drive=ee_pose ik_at_replay=true "
+            "(teleop_omnipicker_and_arm.py --use-ik)",
+            flush=True,
+        )
+    else:
+        print(
+            f"[batch-replay] replay start: {parquet_path} "
+            "replay_drive=joint_direct ik_at_replay=false "
+            "(replay_spacemouse_parquet.py)",
+            flush=True,
+        )
     result = subprocess.run(cmd, check=False)
     print(
         f"[batch-replay] replay done: {parquet_path.name} returncode={result.returncode}",

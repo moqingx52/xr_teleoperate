@@ -277,6 +277,8 @@ class G1_29_ArmController:
         self._sim_joint_mapping_name = "index"
         self._sim_missing_dq_warned = False
         self._sim_unexpected_payload_warned = False
+        self._sim_named_joint_positions = {}
+        self._sim_named_joint_velocities = {}
 
         # initialize subscribe thread
         self.subscribe_thread = threading.Thread(target=self._subscribe_motor_state)
@@ -400,6 +402,22 @@ class G1_29_ArmController:
                 self._last_dq[slot] = _safe_float(dq_safe[idx], self._last_dq[slot])
         return True
 
+    def _update_sim_named_joint_state(self, q_safe, dq_safe, joint_names):
+        if not isinstance(joint_names, list) or len(joint_names) == 0:
+            return
+        positions = {}
+        velocities = {}
+        for idx, joint_name in enumerate(joint_names):
+            name = str(joint_name)
+            if idx < len(q_safe) and q_safe[idx] is not None:
+                positions[name] = _safe_float(q_safe[idx], 0.0)
+            if idx < len(dq_safe) and dq_safe[idx] is not None:
+                velocities[name] = _safe_float(dq_safe[idx], 0.0)
+        if positions:
+            self._sim_named_joint_positions = positions
+        if velocities:
+            self._sim_named_joint_velocities = velocities
+
     def _subscribe_motor_state(self):
         _read_n = 0
         while True:
@@ -443,6 +461,7 @@ class G1_29_ArmController:
                         lowstate = G1_29_LowState()
                         q_safe = list(q)
                         dq_safe = list(dq)
+                        self._update_sim_named_joint_state(q_safe, dq_safe, joint_names)
                         used_named_mapping = self._update_sim_state_from_named_joints(
                             q_safe, dq_safe, joint_names
                         )
@@ -576,6 +595,10 @@ class G1_29_ArmController:
     def get_current_motor_q(self):
         '''Return current state q of all body motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in G1_29_JointIndex])
+
+    def get_sim_named_joint_positions(self):
+        '''Return latest named joint positions from Isaac shared memory.'''
+        return dict(self._sim_named_joint_positions)
     
     def get_current_dual_arm_q(self):
         '''Return current state q of the left and right arm motors.'''
